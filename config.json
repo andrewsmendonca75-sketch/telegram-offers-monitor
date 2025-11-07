@@ -14,83 +14,203 @@
     "@promohypepcgamer",
     "@ofertasdecomputador"
   ],
+  "user_chat_id": 1818469361,
   "products": [
     {
-      "name": "ryzen 7 5700x",
+      "name": "memoria ram 8gb",
       "aliases": [
-        "ryzen 7 5700x",
-        "5700x",
-        "amd 5700x",
-        "ryzen7 5700x"
+        "ram 8gb",
+        "8gb ddr4",
+        "8gb ddr5",
+        "dimm 8gb",
+        "sodimm 8gb"
       ],
-      "max_price": 900.0
+      "must_include_any": [
+        "ram",
+        "ddr4",
+        "ddr5",
+        "dimm",
+        "sodimm",
+        "mhz",
+        "cl"
+      ],
+      "must_exclude_any": [
+        "poco",
+        "xiaomi",
+        "iphone",
+        "android",
+        "smartphone",
+        "celular"
+      ],
+      "max_price": 189.99
     },
     {
-      "name": "ryzen 7 5700",
+      "name": "memoria ram 16gb",
       "aliases": [
-        "ryzen 7 5700",
-        "5700",
-        "amd 5700",
-        "ryzen7 5700"
+        "ram 16gb",
+        "16gb ddr4",
+        "16gb ddr5",
+        "dimm 16gb",
+        "sodimm 16gb"
       ],
-      "max_price": 900.0
+      "must_include_any": [
+        "ram",
+        "ddr4",
+        "ddr5",
+        "dimm",
+        "sodimm",
+        "mhz",
+        "cl"
+      ],
+      "must_exclude_any": [
+        "poco",
+        "xiaomi",
+        "iphone",
+        "android",
+        "smartphone",
+        "celular"
+      ],
+      "max_price": 329.99
     },
     {
-      "name": "rtx 5060",
+      "name": "ps5 console",
       "aliases": [
-        "rtx 5060",
-        "geforce rtx 5060",
-        "nvidia 5060"
+        "ps5",
+        "playstation 5",
+        "ps5 slim",
+        "console ps5"
       ],
-      "max_price": 2100.0
+      "must_include_any": [
+        "ps5",
+        "playstation 5",
+        "console"
+      ],
+      "must_exclude_any": [
+        "jogo",
+        "mídia",
+        "midia",
+        "headset",
+        "fone",
+        "fones",
+        "dualsense",
+        "dual sense",
+        "controle"
+      ],
+      "max_price": 2999.0
     },
     {
-      "name": "b550 motherboard",
+      "name": "controle dualsense",
       "aliases": [
-        "b550",
-        "b550m",
-        "b550 micro atx",
-        "ds3h ac r2"
+        "dualsense",
+        "controle ps5",
+        "dual sense",
+        "controle sem fio ps5"
       ],
-      "max_price": 700.0
+      "must_include_any": [
+        "dualsense",
+        "controle"
+      ],
+      "must_exclude_any": [
+        "jogo",
+        "mídia",
+        "midia",
+        "headset",
+        "fone",
+        "volante"
+      ],
+      "max_price": 349.0
     },
     {
-      "name": "h610 motherboard",
+      "name": "water cooler 240mm",
       "aliases": [
-        "h610m",
-        "h610",
-        "pro h610m-s",
-        "h610 ddr4"
+        "water cooler 240",
+        "watercooler 240",
+        "radiador 240mm",
+        "aio 240mm"
       ],
-      "max_price": 550.0
+      "must_include_any": [
+        "240mm",
+        "240",
+        "aio",
+        "water"
+      ],
+      "must_exclude_any": [],
+      "max_price": 180.0
     },
     {
-      "name": "ssd nvme 1tb (específico)",
+      "name": "ssd nvme 1tb",
       "aliases": [
-        "nv3 1tb",
-        "kingston nv3 1tb",
-        "sn350 1tb",
-        "wd green 1tb"
+        "ssd 1tb",
+        "nvme 1tb",
+        "m.2 1tb"
       ],
+      "must_include_any": [
+        "ssd",
+        "nvme",
+        "m.2"
+      ],
+      "must_exclude_any": [],
       "max_price": 450.0
     },
     {
-      "name": "fonte gigabyte p650g pg5",
+      "name": "fonte 600w+ bronze/gold",
       "aliases": [
-        "p650g pg5",
-        "gigabyte 650w gold",
-        "gp-p650g-pg5"
+        "fonte 600w",
+        "fonte 650w",
+        "fonte 700w",
+        "fonte 750w",
+        "80 plus bronze",
+        "80 plus gold"
+      ],
+      "must_include_any": [
+        "80 plus",
+        "bronze",
+        "gold",
+        "600w",
+        "650w",
+        "700w",
+        "750w"
+      ],
+      "must_exclude_any": [
+        "white",
+        "600w pico",
+        "sfx-l\\b"
       ],
       "max_price": 320.0
     },
     {
-      "name": "gabinete mancer cv450",
+      "name": "ryzen 7 5700x",
       "aliases": [
-        "mancer cv450",
-        "cv450"
+        "ryzen 7 5700x",
+        "ryzen 7 5700",
+        "5700x",
+        "5700"
       ],
-      "max_price": 200.0
+      "must_include_any": [
+        "ryzen",
+        "5700"
+      ],
+      "must_exclude_any": [
+        "g",
+        "5600g",
+        "5800x3d"
+      ],
+      "max_price": 1000.0
+    },
+    {
+      "name": "rx 7600",
+      "aliases": [
+        "rx 7600",
+        "radeon rx 7600",
+        "amd rx 7600"
+      ],
+      "must_include_any": [
+        "rx7600",
+        "rx 7600",
+        "radeon"
+      ],
+      "must_exclude_any": [],
+      "max_price": 1799.0
     }
-  ],
-  "user_chat_id": 1818469361
+  ]
 }
