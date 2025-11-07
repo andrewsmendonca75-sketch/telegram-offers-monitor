@@ -1,3 +1,4 @@
+{
   "channels": [
     "@TalkPC",
     "@pcdorafa",
@@ -14,143 +15,10 @@
     "@ofertasdecomputador"
   ],
   "products": [
-    {
-      "name": "ryzen 7 5700",
-      "aliases": [
-        "ryzen 7 5700",
-        "ryzen 7 5700x",
-        "amd ryzen 5700",
-        "ryzen 5700 processor"
-      ],
-      "max_price": 899.99
-    },
-    {
-      "name": "intel core i5-14400f",
-      "aliases": [
-        "i5 14400f",
-        "intel 14400f",
-        "intel core i5 14400f",
-        "processador 14400f"
-      ],
-      "max_price": 899.99
-    },
-    {
-      "name": "placa-mãe b550",
-      "aliases": [
-        "b550",
-        "b550m",
-        "placa-mae b550",
-        "placa-mãe b550",
-        "motherboard b550",
-        "chipset b550",
-        "b550 asus",
-        "b550 gigabyte",
-        "b550 aorus"
-      ],
-      "max_price": 689.99
-    },
-    {
-      "name": "placa-mãe h610m",
-      "aliases": [
-        "h610m",
-        "placa-mae h610m",
-        "placa-mãe h610m",
-        "motherboard h610m",
-        "h610m-s",
-        "h610m-e",
-        "h610m wifi",
-        "h610m ddr4"
-      ],
-      "max_price": 469.99
-    },
-    {
-      "name": "placa de vídeo rtx 5060",
-      "aliases": [
-        "rtx 5060",
-        "geforce rtx 5060",
-        "inno3d 5060",
-        "placa de video 5060",
-        "placa de vídeo 5060"
-      ],
-      "max_price": 1899.99
-    },
-    {
-      "name": "memória ddr4 16gb 3200mhz",
-      "aliases": [
-        "16gb ddr4 3200",
-        "memoria 16gb",
-        "memória 16gb",
-        "ram 16gb",
-        "ddr4 3200mhz",
-        "memória ddr4 16gb"
-      ],
-      "max_price": 299.99
-    },
-    {
-      "name": "ssd nvme 1tb",
-      "aliases": [
-        "ssd 1tb",
-        "ssd nvme",
-        "ssd m.2 1tb",
-        "ssd 1tb gen4",
-        "ssd 1tb gen3",
-        "ssd 1tb pcie",
-        "ssd 1tb nvme pcie",
-        "ssd kingston 1tb",
-        "ssd sandisk 1tb"
-      ],
-      "max_price": 440.99
-    },
-    {
-      "name": "fonte 650w",
-      "aliases": [
-        "fonte 650w",
-        "fonte atx 650w",
-        "fonte gamer 650w",
-        "650w bronze",
-        "650w gold",
-        "fonte 80 plus",
-        "psu 650w"
-      ],
-      "max_price": 329.99
-    },
-    {
-      "name": "water cooler 240mm",
-      "aliases": [
-        "water cooler 240mm",
-        "watercooler 240mm",
-        "radiador 240mm",
-        "water cooler duplo",
-        "watercooler duplo",
-        "cooler 240mm"
-      ],
-      "max_price": 219.99
-    },
-    {
-      "name": "gabinete gamer micro-atx",
-      "aliases": [
-        "gabinete micro-atx",
-        "gabinete gamer",
-        "gabinete vidro temperado",
-        "gabinete pequeno",
-        "micro atx case",
-        "gabinete rgb"
-      ],
-      "max_price": 189.99
-    },
-    {
-      "name": "kit 5 fans 120mm argb",
-      "aliases": [
-        "kit 5 fans",
-        "kit 5 ventoinhas",
-        "kit ventoinha argb",
-        "ventoinhas 120mm",
-        "kit 5x120mm",
-        "cooler fan 120mm argb"
-      ],
-      "max_price": 159.99
-    }
+    { "name": "rtx 5060", "max_price": 1900 },
+    { "name": "ryzen 7 5700x", "max_price": 950 },
+    { "name": "b550", "max_price": 700 },
+    { "name": "ssd 1tb", "max_price": 450 }
   ],
-   "user_chat_id": 1818469361
+  "user_chat_id": 1818469361
 }
-
