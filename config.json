@@ -15,10 +15,18 @@
     "@ofertasdecomputador"
   ],
   "products": [
-    { "name": "rtx 5060", "max_price": 1900 },
-    { "name": "ryzen 7 5700x", "max_price": 950 },
-    { "name": "b550", "max_price": 700 },
-    { "name": "ssd 1tb", "max_price": 450 }
+    "ps5",
+    "playstation 5",
+    "controle ps5",
+    "controle dualsense",
+    "memoria ram 8gb",
+    "memória ram 8gb",
+    "memoria ram 16gb",
+    "memória ram 16gb",
+    "placa de video rx7600",
+    "rx 7600",
+    "ryzen 7 5700x",
+    "ryzen 7 5700"
   ],
   "user_chat_id": 1818469361
 }
