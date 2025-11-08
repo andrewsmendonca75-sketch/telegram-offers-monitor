@@ -91,7 +91,7 @@ PRICE_RE = re.compile(
 URL_RE = re.compile(r'https?://\S+', re.I)
 
 MODEL_NEAR_RE = re.compile(
-    r'(rtx|gtx|rx|ryzen|i3|i5|i7|i9|b\d{3}|z\d{3}|h\d{3})',
+    r'(rtx|gtx|rx|ryzen|i3|i5|i7|i9|b\d{3}|z\d{3}|h\d{3}|x\d{3}|a\d{3})',
     re.I
 )
 
@@ -99,7 +99,6 @@ def strip_urls(s: str) -> str:
     return URL_RE.sub(' ', s)
 
 def _has_currency_prefix(text: str, start_idx: int) -> bool:
-    # olha até 4 chars pra trás do início do NÚMERO por "r$"
     look = text[max(0, start_idx-4):start_idx].lower().replace(' ', '')
     return 'r$' in look
 
@@ -109,7 +108,6 @@ def _is_adjacent_to_letter(text: str, start: int, end: int) -> bool:
     return (prev.isalpha() or nxt.isalpha())
 
 def _is_installments(text: str, end: int) -> bool:
-    # detecta "12x", "10 x", "em 12x"
     tail = text[end:end+6].lower()
     return bool(re.match(r'\s*(em\s*)?\d{1,2}\s*x\b', tail))
 
@@ -118,7 +116,6 @@ def _is_near_coupon(text: str, start: int) -> bool:
     return 'cupom' in before
 
 def _is_model_number(text: str, start: int, end: int) -> bool:
-    # Se há token de modelo perto do número (rtx/rx/i5/ryzen/b550/h610 etc.), é especificação, não preço
     L = max(0, start - 8)
     R = min(len(text), end + 8)
     window = text[L:R]
@@ -140,20 +137,10 @@ def parse_brl_to_float(s: str) -> Optional[float]:
         return None
 
 def extract_prices(text: str) -> List[Tuple[float, bool]]:
-    """
-    Retorna lista de tuplas (valor, has_currency_prefix) válidas no texto.
-    - remove URLs antes de extrair preços (evita números tipo ?p=2189916)
-    - ignora números colados em letras (AGORA15)
-    - ignora parcelas (12x)
-    - ignora números próximos de 'cupom'
-    - ignora valores muito baixos sem 'R$'
-    - ignora valores absurdos sem 'R$'
-    - ignora números que parecem MODELO (rtx/rx/i5/ryzen/b550/h610) quando não há 'R$'
-    """
     scan_text = strip_urls(text)
     out: List[Tuple[float, bool]] = []
     for m in PRICE_RE.finditer(scan_text):
-        start, end = m.span(1)  # GRUPO DO NÚMERO
+        start, end = m.span(1)
         raw_num = m.group(1)
 
         if _is_adjacent_to_letter(scan_text, start, end):
@@ -180,10 +167,6 @@ def extract_prices(text: str) -> List[Tuple[float, bool]]:
     return out
 
 def choose_best_price(text: str) -> Optional[float]:
-    """
-    1) Se houver preços com "R$", retorna o MENOR (à vista).
-    2) Senão, retorna o MAIOR válido (evita 12/15/39).
-    """
     prices = extract_prices(text)
     if not prices:
         return None
@@ -210,6 +193,7 @@ DDR4 = re.compile(r'\bddr\s*4\b', re.I)
 NEG_RAM = re.compile(r'\b(notebook|laptop|so[\-\s]?dimm|sodimm|celular|smartphone|android|iphone|lpddr|ddr3|ddr5)\b', re.I)
 
 WC_240 = re.compile(r'\bwater\.?\s*cooler\b.*\b240\s*mm\b|\b240\s*mm\b.*\bwater\.?\s*cooler\b', re.I)
+WATER_COOLER_ANY = re.compile(r'\bwater\.?\s*cooler\b', re.I)
 
 def classify_product(text: str) -> Optional[str]:
     t = normalize_text(text)
@@ -235,41 +219,62 @@ KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
     "rtx 5060":     re.compile(r'\brtx\s*50\s*60\b|\brtx\s*5060\b', re.I),
     "rx 7600":      re.compile(r'\brx\s*7600\b', re.I),
 
-    # CPUs AMD
-    "ryzen 7 5700x": re.compile(r'\bryzen\s*7\s*5700x\b', re.I),
-    "ryzen 7 5700":  re.compile(r'\bryzen\s*7\s*5700\b', re.I),
+    # CPUs AMD — somente 5700X ou superior (<= R$ 900)
+    "cpu_amd_5700x_plus": re.compile(
+        r'\bryzen\s*(?:7|9)\s*('
+        r'5700x3d|5700x|5800x3d|5800x|5900x|5950x'
+        r')\b',
+        re.I
+    ),
 
-    # CPUs Intel
-    "i5 14400f":  re.compile(r'\bi[-\s]*5[-\s]*14400f\b', re.I),
-    "i5 13400f":  re.compile(r'\bi[-\s]*5[-\s]*13400f\b', re.I),
-    "i5 12400f":  re.compile(r'\bi[-\s]*5[-\s]*12400f\b', re.I),
-    "i5 14600kf": re.compile(r'\bi[-\s]*5[-\s]*14600kf\b', re.I),
-    "i5 14600k":  re.compile(r'\bi[-\s]*5[-\s]*14600k\b', re.I),
+    # CPUs Intel — somente i5-14400F ou superior (<= R$ 900)
+    # i5: 14400f/14500/14600/k/kf | i7: 12700/13700/14700 (+F/K/KF) | i9: 12900/13900/14900 (+F/K/KF)
+    "cpu_intel_14400f_plus": re.compile(
+        r'\b(?:intel\s*)?(?:core\s*)?i[-\s]*('
+        r'5[-\s]*14400f|5[-\s]*14500|5[-\s]*14600k?f?'   # i5
+        r'|7[-\s]*12?700k?f?|7[-\s]*13?700k?f?|7[-\s]*14?700k?f?'  # i7 12700/13700/14700
+        r'|9[-\s]*12?900k?f?|9[-\s]*13?900k?f?|9[-\s]*14?900k?f?'  # i9 12900/13900/14900
+        r')\b',
+        re.I
+    ),
 
-    # Fontes
-    "fonte 650w":   re.compile(r'\b(fonte|psu)\b.*\b650\s*w\b|\b650\s*w\b.*\b(fonte|psu)\b', re.I),
-    "fonte 600w":   re.compile(r'\b(fonte|psu)\b.*\b600\s*w\b|\b600\s*w\b.*\b(fonte|psu)\b', re.I),
+    # Fontes genéricas (mantidas p/ compat), checaremos 80Plus e Watt/Preço no handler
+    "psu_bg_600": re.compile(
+        r'\b(fonte|psu)\b.*\b(80\s*\+?\s*plus)?\s*(?:bronze|gold)\b|\b(?:bronze|gold)\b.*\b(fonte|psu)\b',
+        re.I
+    ),
 
-    # Placas-mãe
+    # Placas-mãe AM4 (Ryzen 5000) ≤ R$ 680
+    "mobo_amd_am4": re.compile(
+        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(b550m?|b450m?|x570m?|a520m?|x470m?)\b'
+        r'|\b(b550m?|b450m?|x570m?|a520m?|x470m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b',
+        re.I
+    ),
+
+    # Placas-mãe LGA1700 (Intel 12/13/14th) ≤ R$ 680
+    "mobo_intel_lga1700": re.compile(
+        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(h610m?|b660m?|b760m?|h670m?|z690m?|z790m?)\b'
+        r'|\b(h610m?|b660m?|b760m?|h670m?|z690m?|z790m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b',
+        re.I
+    ),
+
+    # Placas-mãe específicas (mantidas; também limitadas a ≤ R$ 680 no handler)
+    "placa mae h610m": re.compile(
+        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(h610m?)\b|\b(h610m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b',
+        re.I
+    ),
+    "h610m": re.compile(r'\bh610m?\b', re.I),
     "placa mae b550": re.compile(
         r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(b550m?)\b|\b(b550m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b',
         re.I
     ),
     "b550": re.compile(r'\bb550m?\b', re.I),
 
-    "placa mae h610m": re.compile(
-        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(h610m?)\b|\b(h610m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b',
-        re.I
-    ),
-    "h610m": re.compile(r'\bh610m?\b', re.I),
-
-    # Filtro de Linha iCLAMPER
+    # Acessórios/energia
     "filtro_linha_iclamper": re.compile(
         r'\bfiltro\s*de\s*linha\b.*\b(i\s*clamper|iclamp(er)?)\b|\b(i\s*clamper|iclamp(er)?)\b.*\bfiltro\s*de\s*linha\b',
         re.I
     ),
-
-    # Kit de fans/ventoinhas (3–9 unidades)
     "kit_fans_3_9": re.compile(
         r'('
         r'(?:\b(kit|combo)\b.*\b(fans?|ventoinhas?)\b.*\b[3-9]\b)'
@@ -280,7 +285,16 @@ KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
         re.I
     ),
 
-    # Gabinete (qualquer menção)
+    # Periféricos
+    "kbd_redragon": re.compile(
+        r'\b(teclado|keyboard)\b.*\bredragon\b|\bredragon\b.*\b(teclado|keyboard)\b',
+        re.I
+    ),
+
+    # Resfriamento
+    "water_cooler_any": re.compile(r'\bwater\.?\s*cooler\b', re.I),
+
+    # Gabinete
     "gabinete": re.compile(r'\bgabinet(e|es|e\s*gamer|es\s*gamer)?\b', re.I),
 }
 
@@ -317,8 +331,7 @@ async def get_target_entity(client: TelegramClient, target: str):
 # ENVIO DA NOTIFICAÇÃO
 # =========================
 def build_alert_text(src_channel: Optional[str], text: str, price: Optional[float]) -> str:
-    # Envia exatamente como veio do canal (sem cabeçalho/“Preço encontrado”)
-    return text
+    return text  # envia exatamente como veio do canal
 
 def send_via_bot_api(token: str, chat_id: str, text: str) -> bool:
     try:
@@ -326,7 +339,6 @@ def send_via_bot_api(token: str, chat_id: str, text: str) -> bool:
         resp = requests.post(url, json={
             "chat_id": chat_id,
             "text": text,
-            # sem parse_mode e sem disable_web_page_preview — mantém igual ao original
         }, timeout=10)
         if resp.status_code != 200:
             warn(f"Bot API HTTP {resp.status_code}: {resp.text}")
@@ -339,6 +351,24 @@ def send_via_bot_api(token: str, chat_id: str, text: str) -> bool:
     except Exception as e:
         warn(f"Falha Bot API: {e}")
         return False
+
+# =========================
+# HELPERS ESPECÍFICOS
+# =========================
+WATT_RE = re.compile(r'(\d{3,4})\s*w\b', re.I)
+
+def max_wattage(text: str) -> Optional[int]:
+    vals = []
+    for m in WATT_RE.finditer(text):
+        try:
+            vals.append(int(m.group(1)))
+        except:
+            pass
+    return max(vals) if vals else None
+
+def has_80plus_bronze_or_gold(text: str) -> bool:
+    t = normalize_text(text)
+    return bool(re.search(r'\b(80\s*\+?\s*plus)?\s*(bronze|gold)\b', t, re.I))
 
 # =========================
 # MAIN
@@ -451,16 +481,64 @@ async def main():
                 info(f"· [{src_username or 'id'}] ignorado (sem match) → {raw[:80]!r}")
                 return
 
-            # PREÇO (não mostramos no alerta, mas usamos para regra do gabinete ≤ 200)
+            # PREÇO (usado para regras específicas)
             price = choose_best_price(raw)
 
-            # Regra específica: GABINETE só se preço ≤ 200
-            if (matched_keyword == "gabinete" or cat == "gabinete"):
-                if price is None or price > 200:
-                    info(f"· [{src_username or 'id'}] ignorado (gabinete acima de 200 ou sem preço) → {raw[:80]!r}")
+            # ====== REGRAS DE LIMITE POR CATEGORIA/PADRÃO ======
+
+            # CPUs: Intel i5-14400F+ e Ryzen 7 5700X+ — ambos ≤ 900
+            if matched_keyword in {"cpu_intel_14400f_plus", "cpu_amd_5700x_plus"}:
+                if price is None or price > 900:
+                    info(f"· [{src_username or 'id'}] ignorado (CPU exigida ≤ 900 ou sem preço) → {raw[:80]!r}")
                     return
 
-            # envia
+            # Gabinete: ≤ 200
+            if (matched_keyword == "gabinete" or cat == "gabinete"):
+                if price is None or price > 200:
+                    info(f"· [{src_username or 'id'}] ignorado (gabinete > 200 ou sem preço) → {raw[:80]!r}")
+                    return
+
+            # Water cooler (qualquer): ≤ 200
+            if matched_keyword == "water_cooler_any" or cat == "water cooler 240mm":
+                if price is None or price > 200:
+                    info(f"· [{src_username or 'id'}] ignorado (water cooler > 200 ou sem preço) → {raw[:80]!r}")
+                    return
+
+            # Teclado Redragon: ≤ 160
+            if matched_keyword == "kbd_redragon":
+                if price is None or price > 160:
+                    info(f"· [{src_username or 'id'}] ignorado (teclado redragon > 160 ou sem preço) → {raw[:80]!r}")
+                    return
+
+            # PSU Bronze/Gold ≥ 600W ≤ 350
+            if matched_keyword == "psu_bg_600":
+                watts = max_wattage(raw)
+                if not has_80plus_bronze_or_gold(raw) or not watts or watts < 600:
+                    info(f"· [{src_username or 'id'}] ignorado (PSU sem Bronze/Gold ou <600W) → {raw[:80]!r}")
+                    return
+                if price is None or price > 350:
+                    info(f"· [{src_username or 'id'}] ignorado (PSU Bronze/Gold ≥600W > 350) → {raw[:80]!r}")
+                    return
+
+            # Placas-mãe Intel LGA1700 (H610/B660/B760/H670/Z690/Z790): ≤ 680
+            if matched_keyword == "mobo_intel_lga1700":
+                if price is None or price > 680:
+                    info(f"· [{src_username or 'id'}] ignorado (mobo LGA1700 > 680 ou sem preço) → {raw[:80]!r}")
+                    return
+
+            # Placas-mãe AMD AM4 (B550/B450/X570/A520/X470): ≤ 680
+            if matched_keyword == "mobo_amd_am4":
+                if price is None or price > 680:
+                    info(f"· [{src_username or 'id'}] ignorado (mobo AM4 > 680 ou sem preço) → {raw[:80]!r}")
+                    return
+
+            # H610M e B550 específicos: ≤ 680
+            if matched_keyword in {"placa mae h610m", "h610m", "placa mae b550", "b550"}:
+                if price is None or price > 680:
+                    info(f"· [{src_username or 'id'}] ignorado (mobo específica > 680 ou sem preço) → {raw[:80]!r}")
+                    return
+
+            # ====== ENVIO ======
             info(f"· [{src_username or 'id'}] match → cat={cat} kw={matched_keyword} price={price} decision=send")
             alert_text = build_alert_text(src_username, raw, price)
 
@@ -477,7 +555,6 @@ async def main():
                     warn(f"Falha ao enviar também para TARGET_CHAT: {e}")
 
             if not sent_bot and not sent_target:
-                # fallback final se nada foi
                 try:
                     await client.send_message(target_entity, alert_text)
                     sent_target = True
