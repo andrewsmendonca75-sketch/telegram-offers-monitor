@@ -33,6 +33,7 @@ USER_CHAT_ID = os.getenv("USER_CHAT_ID", "")  # ex.: 1818469361
 # Fallback/duplicado: enviar também para um chat via Telethon (opcional)
 TARGET_CHAT = os.getenv("TARGET_CHAT", "me")  # "me" = Mensagens Salvas
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
+ALSO_SEND_TO_TARGET = os.getenv("ALSO_SEND_TO_TARGET", "0") == "1"
 
 # =========================
 # LOGS
@@ -72,7 +73,6 @@ def load_config(path: str) -> Dict[str, Any]:
 # NORMALIZA TEXTO
 # =========================
 def normalize_text(s: str) -> str:
-    # normaliza forma, remove espaços invisíveis, colapsa espaços e remove acentos
     s = unicodedata.normalize('NFKC', s)
     s = s.replace('\u200b', '').replace('\u00A0', ' ')
     s = re.sub(r'\s+', ' ', s).strip().lower()
@@ -81,18 +81,19 @@ def normalize_text(s: str) -> str:
     return s
 
 # =========================
-# PREÇO (ROBUSTO)
-# - prioriza "R$"
-# - ignora cupom/parcelas/num colado em letra
+# PREÇOS — regex e utilitários
 # =========================
 PRICE_CORE = r'(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[.,]\d{2})?'
 PRICE_RE = re.compile(
     rf'(?:r\$\s*)?({PRICE_CORE})(?!\s*(?:gb|tb|mhz|ghz|mm|cm))\b',
     re.I
 )
+URL_RE = re.compile(r'https?://\S+', re.I)
+
+def strip_urls(s: str) -> str:
+    return URL_RE.sub(' ', s)
 
 def _has_currency_prefix(text: str, start_idx: int) -> bool:
-    # olha até 4 chars pra trás por "r$" (ignorando espaços)
     look = text[max(0, start_idx-4):start_idx].lower().replace(' ', '')
     return 'r$' in look
 
@@ -102,12 +103,10 @@ def _is_adjacent_to_letter(text: str, start: int, end: int) -> bool:
     return (prev.isalpha() or nxt.isalpha())
 
 def _is_installments(text: str, end: int) -> bool:
-    # padrão "12x", "10 x" logo após o número
     tail = text[end:end+3].lower()
-    return bool(re.match(r'\s*x\b', tail))
+    return bool(re.match(r'\s*x\b', tail))  # 12x
 
 def _is_near_coupon(text: str, start: int) -> bool:
-    # "cupom" muito perto do número tende a ser valor do cupom (AGORA15)
     before = text[max(0, start-12):start].lower()
     return 'cupom' in before
 
@@ -129,33 +128,34 @@ def parse_brl_to_float(s: str) -> Optional[float]:
 def extract_prices(text: str) -> List[Tuple[float, bool]]:
     """
     Retorna lista de tuplas (valor, has_currency_prefix) válidas no texto.
+    - remove URLs antes de extrair preços (evita números de parâmetros tipo ?p=2189916)
     - ignora números colados em letras (ex.: AGORA15)
     - ignora parcelas (12x)
     - ignora números muito próximos de 'cupom'
     - ignora valores muito baixos sem 'R$'
+    - ignora valores absurdamente altos sem 'R$' (provável ID/código)
     """
+    scan_text = strip_urls(text)
     out: List[Tuple[float, bool]] = []
-    for m in PRICE_RE.finditer(text):
-        start, end = m.span(1)  # grupo do número
+    for m in PRICE_RE.finditer(scan_text):
+        start, end = m.span(1)
         raw_num = m.group(1)
 
-        # 1) ignora se encostado em letra (tipo AGORA15)
-        if _is_adjacent_to_letter(text, start, end):
+        if _is_adjacent_to_letter(scan_text, start, end):
             continue
-        # 2) ignora "12x" (parcelas)
-        if _is_installments(text, end):
+        if _is_installments(scan_text, end):
             continue
-        # 3) ignora se próximo de "cupom"
-        if _is_near_coupon(text, start):
+        if _is_near_coupon(scan_text, start):
             continue
 
         val = parse_brl_to_float(raw_num)
         if val is None:
             continue
 
-        has_curr = _has_currency_prefix(text, m.start())
-        # 4) heurística anti-lixo: números muito baixos sem "R$"
+        has_curr = _has_currency_prefix(scan_text, m.start())
         if not has_curr and val < 50:
+            continue
+        if not has_curr and val > 100000:
             continue
 
         out.append((val, has_curr))
@@ -163,9 +163,8 @@ def extract_prices(text: str) -> List[Tuple[float, bool]]:
 
 def choose_best_price(text: str) -> Optional[float]:
     """
-    Estratégia:
-      1) Se houver preços com "R$", retorna o MENOR deles (geralmente o à vista).
-      2) Senão, retorna o MAIOR preço válido (evita pegar 12/15/39).
+    1) Se houver preços com "R$", retorna o MENOR (geralmente à vista).
+    2) Caso contrário, retorna o MAIOR válido (evita pegar 12/15/39).
     """
     prices = extract_prices(text)
     if not prices:
@@ -222,7 +221,7 @@ KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
     "ryzen 7 5700x": re.compile(r'\bryzen\s*7\s*5700x\b', re.I),
     "ryzen 7 5700":  re.compile(r'\bryzen\s*7\s*5700\b', re.I),
 
-    # CPUs Intel (novas)
+    # CPUs Intel
     "i5 14400f":  re.compile(r'\bi[-\s]*5[-\s]*14400f\b', re.I),
     "i5 13400f":  re.compile(r'\bi[-\s]*5[-\s]*13400f\b', re.I),
     "i5 12400f":  re.compile(r'\bi[-\s]*5[-\s]*12400f\b', re.I),
@@ -412,7 +411,7 @@ async def main():
                 info(f"· [{src_username or 'id'}] ignorado (sem match) → {raw[:80]!r}")
                 return
 
-            # PREÇO com heurística anti-cupom/parcelas
+            # PREÇO com heurística anti-cupom/parcelas/URL
             price = choose_best_price(raw)
 
             # envia
@@ -421,18 +420,29 @@ async def main():
 
             alert_text = build_alert_text(src_username, raw, price)
 
-            sent = False
+            sent_bot = False
             if BOT_TOKEN and USER_CHAT_ID:
-                sent = send_via_bot_api(BOT_TOKEN, USER_CHAT_ID, alert_text)
+                sent_bot = send_via_bot_api(BOT_TOKEN, USER_CHAT_ID, alert_text)
 
-            if not sent:
+            sent_target = False
+            if ALSO_SEND_TO_TARGET:
                 try:
                     await client.send_message(target_entity, alert_text)
-                    sent = True
+                    sent_target = True
                 except Exception as e:
-                    warn(f"Falha ao enviar via Telethon TARGET_CHAT: {e}")
+                    warn(f"Falha ao enviar também para TARGET_CHAT: {e}")
 
-            info(f"· envio={'ok' if sent else 'falhou'} → destino={'bot->USER_CHAT_ID' if (BOT_TOKEN and USER_CHAT_ID) else 'TARGET_CHAT'}")
+            if not sent_bot and not sent_target:
+                # fallback final se nada foi
+                try:
+                    await client.send_message(target_entity, alert_text)
+                    sent_target = True
+                except Exception as e:
+                    warn(f"Falha no fallback TARGET_CHAT: {e}")
+
+            info("· envio=ok → destino=" +
+                 ("bot " if sent_bot else "") +
+                 ("+ target" if sent_target else ""))
 
         except FloodWaitError as e:
             warn(f"FloodWait: aguardando {e.seconds}s")
