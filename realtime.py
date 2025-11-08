@@ -73,10 +73,13 @@ def load_config(path: str) -> Dict[str, Any]:
 # NORMALIZA TEXTO / MATCH
 # =========================
 def normalize_text(s: str) -> str:
+    # normaliza forma, remove espaços invisíveis, colapsa espaços e remove acentos
     s = unicodedata.normalize('NFKC', s)
-    s = s.replace('\u200b', '')  # zero-width space
-    s = re.sub(r'\s+', ' ', s)
-    return s.strip().lower()
+    s = s.replace('\u200b', '').replace('\u00A0', ' ')
+    s = re.sub(r'\s+', ' ', s).strip().lower()
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    return s
 
 
 # =========================
@@ -143,6 +146,29 @@ def classify_product(text: str) -> Optional[str]:
     if WC_240.search(t):
         return "water cooler 240mm"
     return None
+
+
+# =========================
+# PADRÕES ROBUSTOS (regex) PARA AS SUAS KEYWORDS
+# funcionam independente de ordem e com variações
+# =========================
+KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
+    # SSDs
+    "ssd nvme 1tb": re.compile(r'\b(ssd).*?(nvme).*?(1\s*tb)\b|\b(nvme).*?(ssd).*?(1\s*tb)\b', re.I),
+    "ssd 1tb":      re.compile(r'\b(ssd).*?(1\s*tb)\b|\b(1\s*tb).*?(ssd)\b', re.I),
+
+    # GPUs
+    "rtx 5060":     re.compile(r'\brtx\s*50\s*60\b|\brtx\s*5060\b', re.I),
+    "rx 7600":      re.compile(r'\brx\s*7600\b', re.I),
+
+    # CPUs
+    "ryzen 7 5700x": re.compile(r'\bryzen\s*7\s*5700x\b', re.I),
+    "ryzen 7 5700":  re.compile(r'\bryzen\s*7\s*5700\b', re.I),
+
+    # Fontes
+    "fonte 650w":   re.compile(r'\b(fonte|psu)\b.*\b650\s*w\b|\b650\s*w\b.*\b(fonte|psu)\b', re.I),
+    "fonte 600w":   re.compile(r'\b(fonte|psu)\b.*\b600\s*w\b|\b600\s*w\b.*\b(fonte|psu)\b', re.I),
+}
 
 
 # =========================
@@ -225,7 +251,7 @@ async def main():
     keywords_cfg: List[str] = cfg.get("keywords", [])
     limits_cfg: Dict[str, float] = cfg.get("limits", {})
 
-    # normaliza keywords
+    # normaliza keywords (fallback simples)
     kw_set = set(normalize_text(k) for k in keywords_cfg if isinstance(k, str) and k.strip())
 
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -288,12 +314,19 @@ async def main():
             except Exception:
                 pass
 
-            # filtros finos
+            # 1) classificador fino
             cat = classify_product(raw)
 
-            # keywords genéricas (se não classificou)
+            # 2) padrões robustos por categoria
             matched_keyword = None
             if cat is None:
+                for key, rx in KEYWORD_PATTERNS.items():
+                    if rx.search(raw):
+                        matched_keyword = key
+                        break
+
+            # 3) fallback: keywords simples do config (normalizado)
+            if cat is None and matched_keyword is None:
                 for k in kw_set:
                     if k in t:
                         matched_keyword = k
