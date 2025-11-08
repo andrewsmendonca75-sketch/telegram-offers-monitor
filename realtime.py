@@ -9,7 +9,7 @@ import fcntl
 import unicodedata
 from typing import List, Dict, Any, Optional
 
-import requests  # para enviar via Bot API
+import requests  # envio via Bot API
 from telethon import events, types
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -32,17 +32,14 @@ USER_CHAT_ID = os.getenv("USER_CHAT_ID", "")  # ex.: 1818469361
 
 # Fallback/duplicado: enviar também para um chat via Telethon (opcional)
 TARGET_CHAT = os.getenv("TARGET_CHAT", "me")  # "me" = Mensagens Salvas
-
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
 
-
 # =========================
-# LOGS SIMPLES
+# LOGS
 # =========================
 def info(msg: str): print(msg, flush=True)
 def warn(msg: str): print(f"WARNING: {msg}", flush=True)
 def err(msg: str):  print(f"ERROR: {msg}", flush=True)
-
 
 # =========================
 # SINGLE INSTANCE LOCK
@@ -56,21 +53,23 @@ def acquire_single_instance_lock() -> int:
         err("Outra instância já está rodando; saindo.")
         sys.exit(0)
 
-
 # =========================
 # CONFIG
 # =========================
 def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        err(f"Falha ao ler {path}: JSON inválido ({e}). Corrija vírgulas finais/comentários.")
+        sys.exit(1)
     cfg.setdefault("channels", [])
     cfg.setdefault("keywords", [])
-    cfg.setdefault("limits", {})
+    cfg.setdefault("limits", {})  # não usamos limites, mas mantemos compat.
     return cfg
 
-
 # =========================
-# NORMALIZA TEXTO / MATCH
+# NORMALIZA TEXTO
 # =========================
 def normalize_text(s: str) -> str:
     # normaliza forma, remove espaços invisíveis, colapsa espaços e remove acentos
@@ -81,7 +80,6 @@ def normalize_text(s: str) -> str:
     s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
     return s
 
-
 # =========================
 # PREÇO (robusto)
 # ignora GB/TB/MHz/mm etc. e valores irreais (< 10)
@@ -91,7 +89,6 @@ PRICE_RE = re.compile(
     r'(?!\s*(?:gb|tb|mhz|ghz|mm|cm))\b',
     re.I
 )
-
 def parse_brl_to_float(s: str) -> Optional[float]:
     try:
         s = s.strip().lower()
@@ -115,19 +112,18 @@ def find_lowest_price(text: str) -> Optional[float]:
             vals.append(v)
     return min(vals) if vals else None
 
-
 # =========================
-# FILTROS FINOS ANTI-FALSO POSITIVO
+# FILTROS FINOS (PS5/DUALSENSE/RAM/WC)
 # =========================
 NEG_PS5 = re.compile(
-    r'\b(jogo|jogos|game|m[ií]dia|steelbook|dlc|capa|case|pel[ií]cula|suporte|dock|base|charging\s*station|grip|thumb|cooler|stand)\b',
+    r'\b(jogo|jogos|game|midia|m[ií]dia|steelbook|dlc|capa|case|pelicula|pel[ií]cula|suporte|dock|base|charging\s*station|grip|thumb|cooler|stand)\b',
     re.I
 )
 PS5_CONSOLE = re.compile(r'\b(ps5|playstation\s*5)\b', re.I)
-PS5_CONSOLE_HINT = re.compile(r'\b(console|slim|edi[cç][aã]o|bundle|m[ií]dia\s*(digital|f[ií]sica)?|vers[aã]o)\b', re.I)
+PS5_CONSOLE_HINT = re.compile(r'\b(console|slim|edicao|edi[cç][aã]o|bundle|midia\s*(digital|fisica|f[ií]sica)?|versao|versa[oã])\b', re.I)
 
 DUALSENSE = re.compile(r'\b(dualsense|controle\s*(ps5|playstation\s*5))\b', re.I)
-NEG_DUALSENSE = re.compile(r'\b(capa|case|grip|thumb|suporte|dock|base|charging\s*station|pel[ií]cula)\b', re.I)
+NEG_DUALSENSE = re.compile(r'\b(capa|case|grip|thumb|suporte|dock|base|charging\s*station|pelicula|pel[ií]cula)\b', re.I)
 
 RAM_SIZE = re.compile(r'\b(8\s*gb|16\s*gb)\b', re.I)
 DDR4 = re.compile(r'\bddr\s*4\b', re.I)
@@ -147,10 +143,8 @@ def classify_product(text: str) -> Optional[str]:
         return "water cooler 240mm"
     return None
 
-
 # =========================
-# PADRÕES ROBUSTOS (regex) PARA AS SUAS KEYWORDS
-# funcionam independente de ordem e com variações
+# PADRÕES ROBUSTOS (regex) PARA KEYWORDS
 # =========================
 KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
     # SSDs
@@ -168,8 +162,13 @@ KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
     # Fontes
     "fonte 650w":   re.compile(r'\b(fonte|psu)\b.*\b650\s*w\b|\b650\s*w\b.*\b(fonte|psu)\b', re.I),
     "fonte 600w":   re.compile(r'\b(fonte|psu)\b.*\b600\s*w\b|\b600\s*w\b.*\b(fonte|psu)\b', re.I),
-}
 
+    # Placa-mãe B550 (qualquer marca/modelo)
+    "placa mae b550": re.compile(
+        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(b550m?)\b|\b(b550m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b', re.I
+    ),
+    "b550": re.compile(r'\bb550m?\b', re.I),
+}
 
 # =========================
 # TELETHON HELPERS
@@ -199,7 +198,6 @@ async def get_target_entity(client: TelegramClient, target: str):
     except Exception as e:
         warn(f"Não consegui resolver TARGET_CHAT '{target}': {e}. Usarei 'me'.")
         return "me"
-
 
 # =========================
 # ENVIO DA NOTIFICAÇÃO
@@ -232,26 +230,21 @@ def send_via_bot_api(token: str, chat_id: str, text: str) -> bool:
         warn(f"Falha Bot API: {e}")
         return False
 
-
 # =========================
 # MAIN
 # =========================
 async def main():
-    # valida envs de leitura (Telethon)
     if not API_ID or not API_HASH or not STRING_SESSION:
         err("API_ID/API_HASH/STRING_SESSION ausentes. Configure as variáveis de ambiente.")
         sys.exit(1)
 
-    # garante 1 instância
     _lock = acquire_single_instance_lock()
 
-    # carrega config
     cfg = load_config(CONFIG_PATH)
     channels_cfg: List[str] = cfg.get("channels", [])
     keywords_cfg: List[str] = cfg.get("keywords", [])
-    limits_cfg: Dict[str, float] = cfg.get("limits", {})
+    # limits_cfg = cfg.get("limits", {})  # sem uso agora
 
-    # normaliza keywords (fallback simples)
     kw_set = set(normalize_text(k) for k in keywords_cfg if isinstance(k, str) and k.strip())
 
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -314,14 +307,14 @@ async def main():
             except Exception:
                 pass
 
-            # 1) classificador fino
+            # 1) classificador fino (mais confiável)
             cat = classify_product(raw)
 
-            # 2) padrões robustos por categoria
+            # 2) padrões robustos por categoria (usa texto normalizado!)
             matched_keyword = None
             if cat is None:
                 for key, rx in KEYWORD_PATTERNS.items():
-                    if rx.search(raw):
+                    if rx.search(t):
                         matched_keyword = key
                         break
 
@@ -332,34 +325,32 @@ async def main():
                         matched_keyword = k
                         break
 
+            # 3.1) Anti-falso-positivo PS5: se cair por "ps5" genérico,
+            # exija que seja console real (não jogo/capa/suporte),
+            # ou if for controle, aplique filtro de acessório.
+            if cat is None and matched_keyword in {"ps5", "controle ps5", "dualsense"}:
+                if matched_keyword == "ps5":
+                    if not (PS5_CONSOLE.search(t) and PS5_CONSOLE_HINT.search(t)) or NEG_PS5.search(t):
+                        info(f"· [{src_username or 'id'}] ignorado (ps5 não é console válido) → {raw[:80]!r}")
+                        return
+                    cat, matched_keyword = "ps5_console", None
+                else:
+                    # controle ps5/dualsense
+                    if not DUALSENSE.search(t) or NEG_DUALSENSE.search(t):
+                        info(f"· [{src_username or 'id'}] ignorado (acessório/cover de controle) → {raw[:80]!r}")
+                        return
+                    cat, matched_keyword = "controle_ps5", None
+
             if cat is None and matched_keyword is None:
                 info(f"· [{src_username or 'id'}] ignorado (sem match) → {raw[:80]!r}")
                 return
 
-            # preço detectado (pode ser None)
+            # preço (opcional)
             price = find_lowest_price(raw)
 
-            # limite de preço (se houver)
-            limit_key = None
-            if cat and cat in limits_cfg:
-                limit_key = cat
-            elif matched_keyword and matched_keyword in limits_cfg:
-                limit_key = matched_keyword
-
-            decision = "send"
-            reason = "sem limite"
-            if limit_key is not None:
-                limit_val = float(limits_cfg[limit_key])
-                if price is None:
-                    decision, reason = "ignore", f"sem preço detectado para limite {limit_key} (R$ {limit_val})"
-                elif price > limit_val:
-                    decision, reason = "ignore", f"preço R$ {price:.2f} > limite {limit_key} (R$ {limit_val:.2f})"
-                else:
-                    reason = f"preço R$ {price:.2f} ≤ limite {limit_key} (R$ {limit_val:.2f})"
-
+            # como removemos limites, sempre envia quando há match
+            decision, reason = "send", "sem limite"
             info(f"· [{src_username or 'id'}] match → cat={cat} kw={matched_keyword} price={price} decision={decision} ({reason})")
-            if decision == "ignore":
-                return
 
             # monta texto e envia
             alert_text = build_alert_text(src_username, raw, price)
@@ -389,7 +380,6 @@ async def main():
     info("▶️ Rodando. Pressione Ctrl+C para sair.")
     await stop_event.wait()
     info("✅ Encerrado.")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
