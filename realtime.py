@@ -65,13 +65,14 @@ def load_config(path: str) -> Dict[str, Any]:
         sys.exit(1)
     cfg.setdefault("channels", [])
     cfg.setdefault("keywords", [])
-    cfg.setdefault("limits", {})  # compat
+    cfg.setdefault("limits", {})  # compatibilidade (não usamos limites)
     return cfg
 
 # =========================
 # NORMALIZA TEXTO
 # =========================
 def normalize_text(s: str) -> str:
+    # normaliza forma, remove espaços invisíveis, colapsa espaços e remove acentos
     s = unicodedata.normalize('NFKC', s)
     s = s.replace('\u200b', '').replace('\u00A0', ' ')
     s = re.sub(r'\s+', ' ', s).strip().lower()
@@ -127,7 +128,11 @@ def parse_brl_to_float(s: str) -> Optional[float]:
 
 def extract_prices(text: str) -> List[Tuple[float, bool]]:
     """
-    Retorna lista de tuplas (valor, has_r$) válidas no texto.
+    Retorna lista de tuplas (valor, has_currency_prefix) válidas no texto.
+    - ignora números colados em letras (ex.: AGORA15)
+    - ignora parcelas (12x)
+    - ignora números muito próximos de 'cupom'
+    - ignora valores muito baixos sem 'R$'
     """
     out: List[Tuple[float, bool]] = []
     for m in PRICE_RE.finditer(text):
@@ -148,12 +153,12 @@ def extract_prices(text: str) -> List[Tuple[float, bool]]:
         if val is None:
             continue
 
-        has_r$ = _has_currency_prefix(text, m.start())
+        has_curr = _has_currency_prefix(text, m.start())
         # 4) heurística anti-lixo: números muito baixos sem "R$"
-        if not has_r$ and val < 50:
+        if not has_curr and val < 50:
             continue
 
-        out.append((val, has_r$))
+        out.append((val, has_curr))
     return out
 
 def choose_best_price(text: str) -> Optional[float]:
@@ -165,10 +170,9 @@ def choose_best_price(text: str) -> Optional[float]:
     prices = extract_prices(text)
     if not prices:
         return None
-    with_r$ = [v for v, has in prices if has]
-    if with_r$:
-        return min(with_r$)
-    # sem "R$": pega o maior
+    with_currency = [v for v, has in prices if has]
+    if with_currency:
+        return min(with_currency)
     return max(v for v, _ in prices)
 
 # =========================
@@ -214,15 +218,22 @@ KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
     "rtx 5060":     re.compile(r'\brtx\s*50\s*60\b|\brtx\s*5060\b', re.I),
     "rx 7600":      re.compile(r'\brx\s*7600\b', re.I),
 
-    # CPUs
+    # CPUs AMD
     "ryzen 7 5700x": re.compile(r'\bryzen\s*7\s*5700x\b', re.I),
     "ryzen 7 5700":  re.compile(r'\bryzen\s*7\s*5700\b', re.I),
+
+    # CPUs Intel (novas)
+    "i5 14400f":  re.compile(r'\bi[-\s]*5[-\s]*14400f\b', re.I),
+    "i5 13400f":  re.compile(r'\bi[-\s]*5[-\s]*13400f\b', re.I),
+    "i5 12400f":  re.compile(r'\bi[-\s]*5[-\s]*12400f\b', re.I),
+    "i5 14600kf": re.compile(r'\bi[-\s]*5[-\s]*14600kf\b', re.I),
+    "i5 14600k":  re.compile(r'\bi[-\s]*5[-\s]*14600k\b', re.I),
 
     # Fontes
     "fonte 650w":   re.compile(r'\b(fonte|psu)\b.*\b650\s*w\b|\b650\s*w\b.*\b(fonte|psu)\b', re.I),
     "fonte 600w":   re.compile(r'\b(fonte|psu)\b.*\b600\s*w\b|\b600\s*w\b.*\b(fonte|psu)\b', re.I),
 
-    # Placa-mãe B550
+    # Placa-mãe B550 (qualquer marca/modelo)
     "placa mae b550": re.compile(
         r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(b550m?)\b|\b(b550m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b', re.I
     ),
