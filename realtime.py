@@ -7,7 +7,7 @@ import asyncio
 import signal
 import fcntl
 import unicodedata
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests  # envio via Bot API
 from telethon import events, types
@@ -65,14 +65,13 @@ def load_config(path: str) -> Dict[str, Any]:
         sys.exit(1)
     cfg.setdefault("channels", [])
     cfg.setdefault("keywords", [])
-    cfg.setdefault("limits", {})  # não usamos limites, mas mantemos compat.
+    cfg.setdefault("limits", {})  # compat
     return cfg
 
 # =========================
 # NORMALIZA TEXTO
 # =========================
 def normalize_text(s: str) -> str:
-    # normaliza forma, remove espaços invisíveis, colapsa espaços e remove acentos
     s = unicodedata.normalize('NFKC', s)
     s = s.replace('\u200b', '').replace('\u00A0', ' ')
     s = re.sub(r'\s+', ' ', s).strip().lower()
@@ -81,14 +80,36 @@ def normalize_text(s: str) -> str:
     return s
 
 # =========================
-# PREÇO (robusto)
-# ignora GB/TB/MHz/mm etc. e valores irreais (< 10)
+# PREÇO (ROBUSTO)
+# - prioriza "R$"
+# - ignora cupom/parcelas/num colado em letra
 # =========================
+PRICE_CORE = r'(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[.,]\d{2})?'
 PRICE_RE = re.compile(
-    r'(?:r\$\s*)?((?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[.,]\d{2})?)'
-    r'(?!\s*(?:gb|tb|mhz|ghz|mm|cm))\b',
+    rf'(?:r\$\s*)?({PRICE_CORE})(?!\s*(?:gb|tb|mhz|ghz|mm|cm))\b',
     re.I
 )
+
+def _has_currency_prefix(text: str, start_idx: int) -> bool:
+    # olha até 4 chars pra trás por "r$" (ignorando espaços)
+    look = text[max(0, start_idx-4):start_idx].lower().replace(' ', '')
+    return 'r$' in look
+
+def _is_adjacent_to_letter(text: str, start: int, end: int) -> bool:
+    prev = text[start-1] if start > 0 else ''
+    nxt  = text[end] if end < len(text) else ''
+    return (prev.isalpha() or nxt.isalpha())
+
+def _is_installments(text: str, end: int) -> bool:
+    # padrão "12x", "10 x" logo após o número
+    tail = text[end:end+3].lower()
+    return bool(re.match(r'\s*x\b', tail))
+
+def _is_near_coupon(text: str, start: int) -> bool:
+    # "cupom" muito perto do número tende a ser valor do cupom (AGORA15)
+    before = text[max(0, start-12):start].lower()
+    return 'cupom' in before
+
 def parse_brl_to_float(s: str) -> Optional[float]:
     try:
         s = s.strip().lower()
@@ -104,13 +125,51 @@ def parse_brl_to_float(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def find_lowest_price(text: str) -> Optional[float]:
-    vals = []
+def extract_prices(text: str) -> List[Tuple[float, bool]]:
+    """
+    Retorna lista de tuplas (valor, has_r$) válidas no texto.
+    """
+    out: List[Tuple[float, bool]] = []
     for m in PRICE_RE.finditer(text):
-        v = parse_brl_to_float(m.group(0))
-        if v is not None:
-            vals.append(v)
-    return min(vals) if vals else None
+        start, end = m.span(1)  # grupo do número
+        raw_num = m.group(1)
+
+        # 1) ignora se encostado em letra (tipo AGORA15)
+        if _is_adjacent_to_letter(text, start, end):
+            continue
+        # 2) ignora "12x" (parcelas)
+        if _is_installments(text, end):
+            continue
+        # 3) ignora se próximo de "cupom"
+        if _is_near_coupon(text, start):
+            continue
+
+        val = parse_brl_to_float(raw_num)
+        if val is None:
+            continue
+
+        has_r$ = _has_currency_prefix(text, m.start())
+        # 4) heurística anti-lixo: números muito baixos sem "R$"
+        if not has_r$ and val < 50:
+            continue
+
+        out.append((val, has_r$))
+    return out
+
+def choose_best_price(text: str) -> Optional[float]:
+    """
+    Estratégia:
+      1) Se houver preços com "R$", retorna o MENOR deles (geralmente o à vista).
+      2) Senão, retorna o MAIOR preço válido (evita pegar 12/15/39).
+    """
+    prices = extract_prices(text)
+    if not prices:
+        return None
+    with_r$ = [v for v, has in prices if has]
+    if with_r$:
+        return min(with_r$)
+    # sem "R$": pega o maior
+    return max(v for v, _ in prices)
 
 # =========================
 # FILTROS FINOS (PS5/DUALSENSE/RAM/WC)
@@ -163,7 +222,7 @@ KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
     "fonte 650w":   re.compile(r'\b(fonte|psu)\b.*\b650\s*w\b|\b650\s*w\b.*\b(fonte|psu)\b', re.I),
     "fonte 600w":   re.compile(r'\b(fonte|psu)\b.*\b600\s*w\b|\b600\s*w\b.*\b(fonte|psu)\b', re.I),
 
-    # Placa-mãe B550 (qualquer marca/modelo)
+    # Placa-mãe B550
     "placa mae b550": re.compile(
         r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(b550m?)\b|\b(b550m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b', re.I
     ),
@@ -243,7 +302,7 @@ async def main():
     cfg = load_config(CONFIG_PATH)
     channels_cfg: List[str] = cfg.get("channels", [])
     keywords_cfg: List[str] = cfg.get("keywords", [])
-    # limits_cfg = cfg.get("limits", {})  # sem uso agora
+    # limits_cfg = cfg.get("limits", {})  # sem uso
 
     kw_set = set(normalize_text(k) for k in keywords_cfg if isinstance(k, str) and k.strip())
 
@@ -325,9 +384,7 @@ async def main():
                         matched_keyword = k
                         break
 
-            # 3.1) Anti-falso-positivo PS5: se cair por "ps5" genérico,
-            # exija que seja console real (não jogo/capa/suporte),
-            # ou if for controle, aplique filtro de acessório.
+            # Anti-falso-positivo PS5 genérico e controle
             if cat is None and matched_keyword in {"ps5", "controle ps5", "dualsense"}:
                 if matched_keyword == "ps5":
                     if not (PS5_CONSOLE.search(t) and PS5_CONSOLE_HINT.search(t)) or NEG_PS5.search(t):
@@ -335,7 +392,6 @@ async def main():
                         return
                     cat, matched_keyword = "ps5_console", None
                 else:
-                    # controle ps5/dualsense
                     if not DUALSENSE.search(t) or NEG_DUALSENSE.search(t):
                         info(f"· [{src_username or 'id'}] ignorado (acessório/cover de controle) → {raw[:80]!r}")
                         return
@@ -345,22 +401,19 @@ async def main():
                 info(f"· [{src_username or 'id'}] ignorado (sem match) → {raw[:80]!r}")
                 return
 
-            # preço (opcional)
-            price = find_lowest_price(raw)
+            # PREÇO com heurística anti-cupom/parcelas
+            price = choose_best_price(raw)
 
-            # como removemos limites, sempre envia quando há match
+            # envia
             decision, reason = "send", "sem limite"
             info(f"· [{src_username or 'id'}] match → cat={cat} kw={matched_keyword} price={price} decision={decision} ({reason})")
 
-            # monta texto e envia
             alert_text = build_alert_text(src_username, raw, price)
 
-            # 1) Envio preferencial via Bot API (gera notificação)
             sent = False
             if BOT_TOKEN and USER_CHAT_ID:
                 sent = send_via_bot_api(BOT_TOKEN, USER_CHAT_ID, alert_text)
 
-            # 2) Fallback/duplicado via Telethon
             if not sent:
                 try:
                     await client.send_message(target_entity, alert_text)
