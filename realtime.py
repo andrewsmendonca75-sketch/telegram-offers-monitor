@@ -26,14 +26,15 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
 
-# Envio primário: Bot API (gera notificação no seu Telegram)
+# Envio primário: Bot API (notificação para você)
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 USER_CHAT_ID = os.getenv("USER_CHAT_ID", "")  # ex.: 1818469361
 
-# Fallback/duplicado: enviar também para um chat via Telethon (opcional)
+# Opcional: enviar também para um chat/canal via Telethon (como você)
 TARGET_CHAT = os.getenv("TARGET_CHAT", "me")  # "me" = Mensagens Salvas
-CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
 ALSO_SEND_TO_TARGET = os.getenv("ALSO_SEND_TO_TARGET", "0") == "1"
+
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
 
 # =========================
 # LOGS
@@ -66,7 +67,6 @@ def load_config(path: str) -> Dict[str, Any]:
         sys.exit(1)
     cfg.setdefault("channels", [])
     cfg.setdefault("keywords", [])
-    cfg.setdefault("limits", {})  # compatibilidade (não usamos limites)
     return cfg
 
 # =========================
@@ -90,10 +90,16 @@ PRICE_RE = re.compile(
 )
 URL_RE = re.compile(r'https?://\S+', re.I)
 
+MODEL_NEAR_RE = re.compile(
+    r'(rtx|gtx|rx|ryzen|i3|i5|i7|i9|b\d{3}|z\d{3}|h\d{3})',
+    re.I
+)
+
 def strip_urls(s: str) -> str:
     return URL_RE.sub(' ', s)
 
 def _has_currency_prefix(text: str, start_idx: int) -> bool:
+    # olha até 4 chars pra trás do início do NÚMERO por "r$"
     look = text[max(0, start_idx-4):start_idx].lower().replace(' ', '')
     return 'r$' in look
 
@@ -103,12 +109,20 @@ def _is_adjacent_to_letter(text: str, start: int, end: int) -> bool:
     return (prev.isalpha() or nxt.isalpha())
 
 def _is_installments(text: str, end: int) -> bool:
-    tail = text[end:end+3].lower()
-    return bool(re.match(r'\s*x\b', tail))  # 12x
+    # detecta "12x", "10 x", "em 12x"
+    tail = text[end:end+6].lower()
+    return bool(re.match(r'\s*(em\s*)?\d{1,2}\s*x\b', tail))
 
 def _is_near_coupon(text: str, start: int) -> bool:
     before = text[max(0, start-12):start].lower()
     return 'cupom' in before
+
+def _is_model_number(text: str, start: int, end: int) -> bool:
+    # Se há token de modelo perto do número (rtx/rx/i5/ryzen/b550/h610 etc.), é especificação, não preço
+    L = max(0, start - 8)
+    R = min(len(text), end + 8)
+    window = text[L:R]
+    return MODEL_NEAR_RE.search(window) is not None
 
 def parse_brl_to_float(s: str) -> Optional[float]:
     try:
@@ -128,17 +142,18 @@ def parse_brl_to_float(s: str) -> Optional[float]:
 def extract_prices(text: str) -> List[Tuple[float, bool]]:
     """
     Retorna lista de tuplas (valor, has_currency_prefix) válidas no texto.
-    - remove URLs antes de extrair preços (evita números de parâmetros tipo ?p=2189916)
-    - ignora números colados em letras (ex.: AGORA15)
+    - remove URLs antes de extrair preços (evita números tipo ?p=2189916)
+    - ignora números colados em letras (AGORA15)
     - ignora parcelas (12x)
-    - ignora números muito próximos de 'cupom'
+    - ignora números próximos de 'cupom'
     - ignora valores muito baixos sem 'R$'
-    - ignora valores absurdamente altos sem 'R$' (provável ID/código)
+    - ignora valores absurdos sem 'R$'
+    - ignora números que parecem MODELO (rtx/rx/i5/ryzen/b550/h610) quando não há 'R$'
     """
     scan_text = strip_urls(text)
     out: List[Tuple[float, bool]] = []
     for m in PRICE_RE.finditer(scan_text):
-        start, end = m.span(1)
+        start, end = m.span(1)  # GRUPO DO NÚMERO
         raw_num = m.group(1)
 
         if _is_adjacent_to_letter(scan_text, start, end):
@@ -152,10 +167,13 @@ def extract_prices(text: str) -> List[Tuple[float, bool]]:
         if val is None:
             continue
 
-        has_curr = _has_currency_prefix(scan_text, m.start())
+        has_curr = _has_currency_prefix(scan_text, start)
+
         if not has_curr and val < 50:
             continue
         if not has_curr and val > 100000:
+            continue
+        if not has_curr and _is_model_number(scan_text, start, end):
             continue
 
         out.append((val, has_curr))
@@ -163,8 +181,8 @@ def extract_prices(text: str) -> List[Tuple[float, bool]]:
 
 def choose_best_price(text: str) -> Optional[float]:
     """
-    1) Se houver preços com "R$", retorna o MENOR (geralmente à vista).
-    2) Caso contrário, retorna o MAIOR válido (evita pegar 12/15/39).
+    1) Se houver preços com "R$", retorna o MENOR (à vista).
+    2) Senão, retorna o MAIOR válido (evita 12/15/39).
     """
     prices = extract_prices(text)
     if not prices:
@@ -232,11 +250,38 @@ KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
     "fonte 650w":   re.compile(r'\b(fonte|psu)\b.*\b650\s*w\b|\b650\s*w\b.*\b(fonte|psu)\b', re.I),
     "fonte 600w":   re.compile(r'\b(fonte|psu)\b.*\b600\s*w\b|\b600\s*w\b.*\b(fonte|psu)\b', re.I),
 
-    # Placa-mãe B550 (qualquer marca/modelo)
+    # Placas-mãe
     "placa mae b550": re.compile(
-        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(b550m?)\b|\b(b550m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b', re.I
+        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(b550m?)\b|\b(b550m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b',
+        re.I
     ),
     "b550": re.compile(r'\bb550m?\b', re.I),
+
+    "placa mae h610m": re.compile(
+        r'\b(placa\s*ma[e]|motherboard|mobo)\b.*\b(h610m?)\b|\b(h610m?)\b.*\b(placa\s*ma[e]|motherboard|mobo)\b',
+        re.I
+    ),
+    "h610m": re.compile(r'\bh610m?\b', re.I),
+
+    # Filtro de Linha iCLAMPER
+    "filtro_linha_iclamper": re.compile(
+        r'\bfiltro\s*de\s*linha\b.*\b(i\s*clamper|iclamp(er)?)\b|\b(i\s*clamper|iclamp(er)?)\b.*\bfiltro\s*de\s*linha\b',
+        re.I
+    ),
+
+    # Kit de fans/ventoinhas (3–9 unidades)
+    "kit_fans_3_9": re.compile(
+        r'('
+        r'(?:\b(kit|combo)\b.*\b(fans?|ventoinhas?)\b.*\b[3-9]\b)'
+        r'|(?:\b[3-9]\b.*\b(kit|combo)\b.*\b(fans?|ventoinhas?)\b)'
+        r'|(?:\b(fans?|ventoinhas?)\b.*\b[3-9]\s*(?:em\s*1|un|unid|pcs?|p[cç]s|pecas|pe[cç]as)\b)'
+        r'|(?:\b[3-9]\s*(?:em\s*1|un|unid|pcs?|p[cç]s|pecas|pe[cç]as)\b.*\b(fans?|ventoinhas?)\b)'
+        r')',
+        re.I
+    ),
+
+    # Gabinete (qualquer menção)
+    "gabinete": re.compile(r'\bgabinet(e|es|e\s*gamer|es\s*gamer)?\b', re.I),
 }
 
 # =========================
@@ -272,11 +317,8 @@ async def get_target_entity(client: TelegramClient, target: str):
 # ENVIO DA NOTIFICAÇÃO
 # =========================
 def build_alert_text(src_channel: Optional[str], text: str, price: Optional[float]) -> str:
-    ch = f"@{src_channel}" if src_channel else "Canal"
-    header = f"🔥 Alerta em {ch}"
-    if price is not None:
-        return f"{header}\n\n• Preço encontrado: R$ {price:,.2f}\n\n{text}"
-    return f"{header}\n\n{text}"
+    # Envia exatamente como veio do canal (sem cabeçalho/“Preço encontrado”)
+    return text
 
 def send_via_bot_api(token: str, chat_id: str, text: str) -> bool:
     try:
@@ -284,8 +326,7 @@ def send_via_bot_api(token: str, chat_id: str, text: str) -> bool:
         resp = requests.post(url, json={
             "chat_id": chat_id,
             "text": text,
-            "disable_web_page_preview": True,
-            "parse_mode": "HTML"
+            # sem parse_mode e sem disable_web_page_preview — mantém igual ao original
         }, timeout=10)
         if resp.status_code != 200:
             warn(f"Bot API HTTP {resp.status_code}: {resp.text}")
@@ -312,7 +353,6 @@ async def main():
     cfg = load_config(CONFIG_PATH)
     channels_cfg: List[str] = cfg.get("channels", [])
     keywords_cfg: List[str] = cfg.get("keywords", [])
-    # limits_cfg = cfg.get("limits", {})  # sem uso
 
     kw_set = set(normalize_text(k) for k in keywords_cfg if isinstance(k, str) and k.strip())
 
@@ -376,10 +416,10 @@ async def main():
             except Exception:
                 pass
 
-            # 1) classificador fino (mais confiável)
+            # 1) classificador fino
             cat = classify_product(raw)
 
-            # 2) padrões robustos por categoria (usa texto normalizado!)
+            # 2) padrões robustos
             matched_keyword = None
             if cat is None:
                 for key, rx in KEYWORD_PATTERNS.items():
@@ -387,7 +427,7 @@ async def main():
                         matched_keyword = key
                         break
 
-            # 3) fallback: keywords simples do config (normalizado)
+            # 3) fallback: keywords simples do config
             if cat is None and matched_keyword is None:
                 for k in kw_set:
                     if k in t:
@@ -411,13 +451,17 @@ async def main():
                 info(f"· [{src_username or 'id'}] ignorado (sem match) → {raw[:80]!r}")
                 return
 
-            # PREÇO com heurística anti-cupom/parcelas/URL
+            # PREÇO (não mostramos no alerta, mas usamos para regra do gabinete ≤ 200)
             price = choose_best_price(raw)
 
-            # envia
-            decision, reason = "send", "sem limite"
-            info(f"· [{src_username or 'id'}] match → cat={cat} kw={matched_keyword} price={price} decision={decision} ({reason})")
+            # Regra específica: GABINETE só se preço ≤ 200
+            if (matched_keyword == "gabinete" or cat == "gabinete"):
+                if price is None or price > 200:
+                    info(f"· [{src_username or 'id'}] ignorado (gabinete acima de 200 ou sem preço) → {raw[:80]!r}")
+                    return
 
+            # envia
+            info(f"· [{src_username or 'id'}] match → cat={cat} kw={matched_keyword} price={price} decision=send")
             alert_text = build_alert_text(src_username, raw, price)
 
             sent_bot = False
