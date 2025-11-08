@@ -1,232 +1,295 @@
 # realtime.py
 import os
-import re
+import sys
 import json
+import re
 import asyncio
-import logging
-from datetime import datetime
+import signal
+import fcntl
+from typing import List, Dict, Any, Optional
 
-import requests
-from dotenv import load_dotenv
-from telethon import TelegramClient, events, functions
+from telethon import events
+from telethon import functions
+from telethon import types
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-
-# ---------------------------------------
-# LOGGING
-# ---------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+from telethon.errors.rpcerrorlist import (
+    UsernameNotOccupiedError,
+    AuthKeyDuplicatedError,
+    FloodWaitError,
 )
-log = logging.getLogger("monitor")
 
-# ---------------------------------------
-# ENV / CONFIG
-# ---------------------------------------
-load_dotenv()
-
+# -------------------------
+# Config / Env
+# -------------------------
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-USER_CHAT_ID = int(os.getenv("USER_CHAT_ID", os.getenv("TELEGRAM_USER_CHAT_ID", "0")))
+TARGET_CHAT = os.getenv("TARGET_CHAT", "me")  # destino dos alertas (ex.: @canalandrwss) ou "me"
 
-# ---------------------------------------
-# CANAIS MONITORADOS
-# ---------------------------------------
-CHANNELS = [
-    "@canalandrwss",
-    "@pcdorafa",
-    "@ofertaskabum",
-    "@terabyteshopoficial",
-    "@pichauofertas",
-    "@sohardwaredorocha",
-    "@soplacadevideo",
-    "@chinasuperofertas",
-    "@compramosnachin",
-]
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
 
-# ---------------------------------------
-# PALAVRAS-CHAVE
-# ---------------------------------------
-KEYWORDS = [
-    # Consoles
-    "ps5", "dualsense", "controle ps5",
+# -------------------------
+# Logging simples (prints)
+# -------------------------
+def info(msg: str): print(msg, flush=True)
+def warn(msg: str): print(f"WARNING: {msg}", flush=True)
+def err(msg: str):  print(f"ERROR: {msg}", flush=True)
 
-    # Memórias
-    "memoria ram 8gb", "memória ram 8gb", "ram 8gb",
-    "memoria ram 16gb", "memória ram 16gb", "ram 16gb",
+# -------------------------
+# Single-instance lock
+# -------------------------
+def acquire_single_instance_lock() -> int:
+    lock_fd = os.open("/tmp/telegram_monitor.lock", os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except OSError:
+        err("Outra instância já está rodando; saindo.")
+        sys.exit(0)
 
-    # Placas de vídeo e processadores
-    "rx 7600",
-    "ryzen 7 5700x", "ryzen 7 5700",
-    "rtx 5060",
+# -------------------------
+# Leitura do config.json
+# -------------------------
+def load_config(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg.setdefault("channels", [])
+    cfg.setdefault("keywords", [])
+    cfg.setdefault("limits", {})
+    return cfg
 
-    # Armazenamento
-    "ssd 1tb", "ssd nvme 1tb",
+# -------------------------
+# Regex úteis
+# -------------------------
 
-    # Coolers e fontes
-    "water cooler 240mm",
-    "fonte 600w", "fonte 650w",
-
-    # Periféricos
-    "redragon kumara", "kumara", "k552",
-    "teclado kumara", "teclado redragon kumara",
-    "teclado redragon k552", "teclado mecanico kumara",
-    "teclado mecânico kumara", "teclado mecanico redragon",
-]
-
-# ---------------------------------------
-# LIMITES DE PREÇO (alerta especial)
-# ---------------------------------------
-LIMITS = {
-    "ssd 1tb": 450.0,
-    "ssd nvme 1tb": 450.0,
-    "water cooler 240mm": 180.0,
-    "fonte 600w": 320.0,
-    "fonte 650w": 320.0,
-}
-
-# ---------------------------------------
-# PARSER DE PREÇO (corrigido)
-# ---------------------------------------
-PRICE_PAT = re.compile(
-    r"(?:R\$\s*)?(\d{1,3}(?:[\.\s]\d{3})*(?:,\d{2})|\d+(?:[.,]\d{2})?)",
-    flags=re.IGNORECASE
+# Preço em R$
+# Ex.: R$ 1.799,90 | 1799,90 | 1.799 | R$1799
+PRICE_RE = re.compile(
+    r'(?:r\$?\s*)?(\d{1,3}(?:[.\s]\d{3})*(?:,\d{2})|\d+(?:,\d{2}))',
+    re.I
 )
 
-def to_float_brl(txt: str) -> float:
-    t = txt.strip().replace(" ", "")
-    if "," in t and "." in t:
-        t = t.replace(".", "").replace(",", ".")
-    elif "," in t:
-        t = t.replace(",", ".")
+def parse_brl_to_float(s: str) -> Optional[float]:
     try:
-        return float(t)
-    except ValueError:
-        return -1.0
+        s = s.strip().lower().replace("r$", "").strip()
+        s = s.replace(".", "").replace(" ", "")
+        s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return None
 
-def find_price(text: str) -> float:
-    matches = PRICE_PAT.findall(text.replace("\n", " "))
-    if not matches:
-        return -1.0
-    prices = [to_float_brl(m) for m in matches if to_float_brl(m) > 0]
-    if not prices:
-        return -1.0
-    return min(prices)
+def find_lowest_price(text: str) -> Optional[float]:
+    prices = []
+    for m in PRICE_RE.finditer(text):
+        val = parse_brl_to_float(m.group(0))
+        if val is not None:
+            prices.append(val)
+    return min(prices) if prices else None
 
-# ---------------------------------------
-# FILTROS
-# ---------------------------------------
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", s.lower())
+# --- Filtros para eliminar falsos positivos ---
 
-def match_keyword(text: str) -> str:
-    t = normalize(text)
-    for kw in KEYWORDS:
-        if kw in t:
-            return kw
-    return ""
+NEG_PS5 = re.compile(
+    r'\b(jogo|jogos|game|m[ií]dia|steelbook|dlc|capa|case|pel[ií]cula|suporte|dock|base|charging\s*station|grip|thumb|cooler|stand)\b',
+    re.I
+)
+PS5_CONSOLE = re.compile(r'\b(ps5|playstation\s*5)\b', re.I)
+PS5_CONSOLE_HINT = re.compile(r'\b(console|slim|edi[cç][aã]o|bundle|m[ií]dia\s*(digital|f[ií]sica)|vers[aã]o)\b', re.I)
 
-def extra_constraints_ok(kw: str, text: str) -> bool:
-    t = normalize(text)
-    if "ps5" in kw:
-        if any(x in t for x in ["headset", "fone", "jogo", "game", "midia"]):
-            return False
-    return True
+DUALSENSE = re.compile(r'\b(dualsense|controle\s*(ps5|playstation\s*5))\b', re.I)
+NEG_DUALSENSE = re.compile(r'\b(capa|case|grip|thumb|suporte|dock|base|charging\s*station|pel[ií]cula)\b', re.I)
 
-# ---------------------------------------
-# ENVIO DE ALERTAS
-# ---------------------------------------
-def send_via_bot(alert_text: str) -> bool:
-    if not BOT_TOKEN or not USER_CHAT_ID:
-        return False
+RAM_SIZE = re.compile(r'\b(8\s*gb|16\s*gb)\b', re.I)
+DDR4 = re.compile(r'\bddr\s*4\b', re.I)
+NEG_RAM = re.compile(r'\b(notebook|laptop|so[\-\s]?dimm|sodimm|celular|smartphone|android|iphone|lpddr|ddr3|ddr5)\b', re.I)
+
+WC_240 = re.compile(r'\bwater\.?\s*cooler\b.*\b240\s*mm\b|\b240\s*mm\b.*\bwater\.?\s*cooler\b', re.I)
+
+def classify_product(text: str) -> Optional[str]:
+    """Retorna uma categoria 'afinada' ou None (ignorar)."""
+    t = text.lower()
+
+    # PS5 console: requer dica de console e não pode ter termos negativos (jogo/acessório)
+    if PS5_CONSOLE.search(t) and PS5_CONSOLE_HINT.search(t) and not NEG_PS5.search(t):
+        return "ps5_console"
+
+    # Controle PS5 (DualSense)
+    if DUALSENSE.search(t) and not NEG_DUALSENSE.search(t):
+        return "controle_ps5"
+
+    # RAM DDR4 desktop 8/16GB (não notebook/celular/LPDDR/DDR3/DDR5)
+    if RAM_SIZE.search(t) and DDR4.search(t) and not NEG_RAM.search(t):
+        return "ram_ddr4"
+
+    # Water Cooler 240mm
+    if WC_240.search(t):
+        return "water cooler 240mm"
+
+    return None
+
+# -------------------------
+# Telethon helpers
+# -------------------------
+async def resolve_channels(client: TelegramClient, refs: List[str]) -> List[types.InputPeerChannel]:
+    resolved: List[types.InputPeerChannel] = []
+    for ref in refs:
+        try:
+            ent = await client.get_entity(ref)
+            if hasattr(ent, "id") and hasattr(ent, "access_hash"):
+                resolved.append(types.InputPeerChannel(ent.id, ent.access_hash))
+            else:
+                warn(f"Ignorando '{ref}': não é canal/supergrupo.")
+        except UsernameNotOccupiedError:
+            warn(f"⚠️ Username inexistente: {ref}")
+        except ValueError as e:
+            warn(f"⚠️ Não foi possível resolver '{ref}': {e}")
+        except Exception as e:
+            warn(f"⚠️ Erro inesperado ao resolver '{ref}': {e}")
+    return resolved
+
+async def get_target_entity(client: TelegramClient, target: str):
+    # "me" envia para Mensagens Salvas
+    if target.strip().lower() == "me":
+        return "me"
     try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": USER_CHAT_ID, "text": alert_text},
-            timeout=10
-        )
-        if resp.ok:
-            log.info(f"📨 Bot API -> {resp.status_code} OK")
-            return True
-        else:
-            log.error(f"❌ Bot API falhou -> {resp.status_code} {resp.text}")
-            return False
+        return await client.get_entity(target)
     except Exception as e:
-        log.exception(f"❌ Bot API exception: {e}")
-        return False
+        err(f"Não consegui resolver TARGET_CHAT '{target}': {e}. Vou usar 'me'.")
+        return "me"
 
-async def send_fallback_telethon(client: TelegramClient, alert_text: str):
-    try:
-        await client.send_message("me", f"[fallback] {alert_text}")
-        log.info("🧷 Fallback -> enviado para mensagens salvas.")
-    except Exception as e:
-        log.exception(f"❌ Fallback Telethon falhou: {e}")
+# -------------------------
+# Mensagem de alerta
+# -------------------------
+def build_alert_text(src_channel: Optional[str], text: str, price: Optional[float]) -> str:
+    ch = f"@{src_channel}" if src_channel else "Canal"
+    header = f"🔥 Alerta em {ch}"
+    if price is not None:
+        return f"{header}\n\n• Preço encontrado: R$ {price:,.2f}\n\n{text}"
+    return f"{header}\n\n{text}"
 
-async def send_alert(client: TelegramClient, title: str, price: float, raw: str, channel: str):
-    msg = (
-        f"🔥 Alerta em {channel}\n\n"
-        f"• {title.title()} | preço encontrado: R$ {price:.2f}\n\n"
-        f"{raw.strip()}"
-    )
-    ok = send_via_bot(msg)
-    if not ok:
-        await send_fallback_telethon(client, msg)
-
-# ---------------------------------------
-# MAIN
-# ---------------------------------------
+# -------------------------
+# Main
+# -------------------------
 async def main():
+    # valida envs
+    if not API_ID or not API_HASH or not STRING_SESSION:
+        err("API_ID/API_HASH/STRING_SESSION ausentes. Configure as variáveis de ambiente.")
+        sys.exit(1)
+
+    # lock single instance
+    _lock = acquire_single_instance_lock()
+
+    # carrega config
+    cfg = load_config(CONFIG_PATH)
+    channels_cfg: List[str] = cfg.get("channels", [])
+    keywords_cfg: List[str] = cfg.get("keywords", [])
+    limits_cfg: Dict[str, float] = cfg.get("limits", {})
+
+    # normaliza keywords p/ comparação case-insensitive
+    kw_set = set(k.strip().lower() for k in keywords_cfg if isinstance(k, str) and k.strip())
+
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-    await client.connect()
-    if not await client.is_user_authorized():
-        log.error("❌ Sessão inválida. Refaça o make_session.py.")
+
+    # graceful shutdown
+    stop_event = asyncio.Event()
+
+    def _graceful(*_):
+        info("Recebi sinal — desconectando...")
+        try:
+            asyncio.create_task(client.disconnect())
+        except Exception:
+            pass
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _graceful)
+    signal.signal(signal.SIGINT, _graceful)
+
+    # conecta
+    try:
+        await client.connect()
+    except AuthKeyDuplicatedError:
+        err("❌ AuthKeyDuplicatedError: a mesma sessão conectou em dois IPs (deploy paralelo). "
+            "Gere uma nova TELEGRAM_STRING_SESSION e garanta 1 instância apenas.")
         return
 
-    try:
-        await client(functions.help.GetConfigRequest())
-        log.info("✅ Conectado ao Telegram; iniciando monitoramento…")
-    except Exception:
-        log.info("✅ Conectado; monitorando canais…")
+    if not await client.is_user_authorized():
+        err("Sessão não autorizada. Gere a TELEGRAM_STRING_SESSION corretamente (use make_session.py).")
+        return
 
-    for ch in CHANNELS:
+    # resolve canais
+    resolved_chats = await resolve_channels(client, channels_cfg)
+    if not resolved_chats:
+        err("Nenhum canal válido no config. Encerrando.")
+        return
+
+    target_entity = await get_target_entity(client, TARGET_CHAT)
+
+    info(f"✅ Logado — monitorando {len(resolved_chats)} canais…")
+
+    # --- Handler de mensagens novas ---
+    @client.on(events.NewMessage(chats=resolved_chats))
+    async def on_new_message(event):
         try:
-            await client.get_entity(ch)
-        except Exception as e:
-            log.warning(f"⚠️ Não foi possível resolver canal {ch}: {e}")
+            raw = event.raw_text or ""
+            t = raw.lower()
 
-    log.info(f"✅ Logado — monitorando {len(CHANNELS)} canais...")
+            # canal origem (melhor para log/alerta)
+            src_username = None
+            try:
+                ch = await event.get_chat()
+                src_username = getattr(ch, "username", None)
+            except Exception:
+                pass
 
-    @client.on(events.NewMessage(chats=CHANNELS))
-    async def handler(event):
-        try:
-            text = event.raw_text or ""
-            ch = getattr(event.chat, 'username', None)
-            channel_ref = f"@{ch}" if ch else "canal"
+            # 1) filtro fino (evita PS5 jogo/acessório; RAM celular/notebook; etc.)
+            cat = classify_product(raw)
 
-            kw = match_keyword(text)
-            if not kw:
+            # 2) se não bateu nas categorias finas, verifique keywords genéricas
+            matched_keyword = None
+            if cat is None:
+                for k in kw_set:
+                    if k in t:
+                        matched_keyword = k
+                        break
+
+            if (cat is None) and (matched_keyword is None):
+                # nada relevante → ignore
                 return
-            if not extra_constraints_ok(kw, text):
-                log.info(f"Ignorado (restrição adicional): {kw} em {channel_ref}")
-                return
 
-            price = find_price(text)
-            limit = LIMITS.get(kw, None)
+            # 3) preço detectado
+            price = find_lowest_price(raw)
 
-            if price > 0:
-                log.info(f"Keyword: {kw} | Preço identificado: R$ {price:.2f} (limite: {limit})")
-            else:
-                log.info(f"Keyword: {kw} | Preço não identificado")
+            # 4) verifica limites quando existir
+            #    prioridade: se cat mapeia exatamente a uma chave do limits_cfg, usa-a
+            #    caso contrário, usa limite pela palavra-chave matched_keyword (se houver)
+            limit_key = None
+            if cat and cat in limits_cfg:
+                limit_key = cat
+            elif matched_keyword and matched_keyword in limits_cfg:
+                limit_key = matched_keyword
 
-            title = kw.replace("_", " ").title()
-            await send_alert(client, title, price if price > 0 else 0.0, text, channel_ref)
+            if limit_key is not None:
+                limit_val = float(limits_cfg[limit_key])
+                if price is None or price > limit_val:
+                    # não atende limite → ignore
+                    return
 
+            # 5) envia alerta
+            alert_text = build_alert_text(src_username, raw, price)
+            await client.send_message(target_entity, alert_text)
+
+        except FloodWaitError as e:
+            warn(f"FloodWait: aguardando {e.seconds}s")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
-            log.exception(f"Erro no handler: {e}")
+            warn(f"Erro no handler: {e}")
 
-    await client.run_until_disconnected()
+    # inicia e aguarda
+    await client.start()
+    info("▶️ Rodando. Pressione Ctrl+C para sair.")
+    await stop_event.wait()
+    info("✅ Encerrado.")
 
 if __name__ == "__main__":
     asyncio.run(main())
+
