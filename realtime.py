@@ -20,6 +20,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+def _pad_channel(ch: str, width: int = 20) -> str:
+    if not ch:
+        ch = "(desconhecido)"
+    if ch != "(desconhecido)" and not ch.startswith("@"):
+        ch = "@" + ch
+    return f"{ch:<{width}}"
+
+def _log_event(channel: str, action: str, label: str, price: Optional[float], reason: str):
+    """
+    action: 'MATCH' | 'IGNORADO' | 'BLOQUEADO'
+    """
+    ch = _pad_channel(channel)
+    p = f"{price:.2f}" if isinstance(price, (int, float)) else "None"
+    if action == "MATCH":
+        logging.info(f"· [{ch}] MATCH    → {label:<22} price={p} reason={reason}")
+    elif action == "BLOQUEADO":
+        logging.info(f"· [{ch}] BLOQUEADO → {label:<22} price={p} reason={reason}")
+    else:
+        logging.info(f"· [{ch}] IGNORADO → {label:<22} price={p} reason={reason}")
+
 # ---------------------------------------------
 # ENV
 # ---------------------------------------------
@@ -80,7 +100,6 @@ else:
 BOT_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 def bot_send_text(dest: str, text: str) -> Tuple[bool, str]:
-    """Envia texto via Bot API, sem parse_mode para evitar 'unsupported parse_mode'."""
     payload = {
         "chat_id": dest,
         "text": text,
@@ -111,20 +130,12 @@ def send_alert_to_all(text: str):
                 log.error(f"· Falha ao enviar via bot (depois de retry): {msg}")
 
 # ---------------------------------------------
-# PREÇOS — parser BR
+# PREÇOS — parser BR (robusto)
 # ---------------------------------------------
+TIME_LIKE_RX = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
 PRICE_REGEX = re.compile(
-    r"""
-    (?:
-        (?:r\$\s*)?
-        (?:
-            \d{1,3}(?:\.\d{3})+(?:,\d{2})? |
-            \d+(?:,\d{2})? |
-            \d+\.\d{2}
-        )
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2})|\d+\.\d{2})",
+    re.IGNORECASE
 )
 
 def _to_float(num: str) -> Optional[float]:
@@ -147,25 +158,37 @@ def _to_float(num: str) -> Optional[float]:
     return None
 
 def parse_lowest_price_brl(text: str) -> Optional[float]:
-    vals: List[float] = []
-    for m in PRICE_REGEX.finditer(text):
-        raw = m.group(0)
-        raw_num = re.sub(r"(?i)^r\$\s*", "", raw).strip()
-        v = _to_float(raw_num)
-        if v is not None:
-            vals.append(v)
-    if not vals:
+    if not text:
         return None
-    cleaned = [v for v in vals if v >= 5.0]
-    if not cleaned:
-        cleaned = vals
-    return min(cleaned) if cleaned else None
+    # remove horários (ex.: "6:00") que viram preço 6.00 por engano
+    text = TIME_LIKE_RX.sub("", text)
+    matches = list(PRICE_REGEX.finditer(text))
+    if not matches:
+        return None
+
+    scored = []
+    for m in matches:
+        raw = m.group(0)
+        val = _to_float(m.group(1))
+        if val is None or val < 5:
+            continue
+        score = 1
+        if raw.lower().strip().startswith("r$"):
+            score += 2
+        scored.append((score, val))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: (-x[0], x[1]))  # melhor score e menor valor
+    return scored[0][1]
 
 # ---------------------------------------------
 # REGEX — categorias/produtos
 # ---------------------------------------------
 # GPU
-GPU_RE = re.compile(r"\b(?:rtx\s*5060|rx\s*7600)\b", re.IGNORECASE)
+GPU_TARGET_RE = re.compile(r"\b(?:rtx\s*5060|rx\s*7600)\b", re.IGNORECASE)
+GPU_EXCLUDE_RE = re.compile(r"\brtx\s*5050\b", re.IGNORECASE)
 
 # CPU Intel
 INTEL_CPU_OK = re.compile(r"""\b(?:i5[-\s]*12(?:600|700)k?f?|i5[-\s]*13(?:400|500|600)k?f?|i5[-\s]*14(?:400|500|600)k?f?|i7[-\s]*1[234](?:700|900)k?f?|i9[-\s]*\d{4,5}k?f?)\b""", re.IGNORECASE)
@@ -210,10 +233,6 @@ ICLAMPER_RE = re.compile(r"\biclamper\b|\bclamp(?:er)?\b", re.IGNORECASE)
 # Kit de fans
 KIT_FANS_RE = re.compile(r"\b(?:kit\s*(?:de\s*)?(?:fans?|ventoinhas?)|ventoinhas?\s*kit)\b", re.IGNORECASE)
 
-# Teclado Redragon
-REDRAGON_KB_RE = re.compile(r"\bredragon\b", re.IGNORECASE)
-KUMARA_RE = re.compile(r"\bkumara\b", re.IGNORECASE)
-
 # RAM
 RAM_RE = re.compile(r"\b(?:mem[oó]ria\s*ram|ram)\b", re.IGNORECASE)
 DDR4_RE = re.compile(r"\bddr4\b", re.IGNORECASE)
@@ -223,8 +242,37 @@ MHZ_3200_RE = re.compile(r"\b(?:3200\s*mhz|3200mhz|3200)\b", re.IGNORECASE)
 
 # SSD NVMe M.2 1TB
 SSD_RE = re.compile(r"\bssd\b", re.IGNORECASE)
-M2_RE = re.compile(r"\b(?:m\.?2|m2|nvme|nvme|nv3)\b", re.IGNORECASE)
+M2_RE = re.compile(r"\b(?:m\.?2|m2|nvme|nv3)\b", re.IGNORECASE)
 TB1_RE = re.compile(r"\b1\s*tb\b", re.IGNORECASE)
+
+# Posts não-produto (vídeo / redes)
+NON_PRODUCT_HINTS = [
+    "saiu vídeo", "saiu video", "vídeo novo", "video novo",
+    "assista", "review no youtube", "canal no youtube",
+]
+BLOCK_URL_SUBSTRS = ["youtube.com", "youtu.be", "shorts/", "tiktok.com", "instagram.com/reel"]
+
+def is_non_product_post(text: str) -> bool:
+    blob = (text or "").lower()
+    if any(h in blob for h in NON_PRODUCT_HINTS):
+        return True
+    if any(bad in blob for bad in BLOCK_URL_SUBSTRS):
+        return True
+    return False
+
+# Teclado Redragon — Kumara + superiores
+REDRAGON_RE = re.compile(r"\bredragon\b|\brdgm?\b", re.IGNORECASE)
+KUMARA_RE = re.compile(r"\bkumara\b|\bk-?552\b|\bk-?552rgb\b|\bk-?552rgb-?1\b|\bk-?552rgb-?pro\b|\bkumara\s*pro\b", re.IGNORECASE)
+REDRAGON_SUPERIOR_RE = re.compile(
+    r"(\bdevarajas\b|\bk-?556\b|"
+    r"\bsurara\b|\bk-?582\b|"
+    r"\bdraconic\b|\bk-?530\b|"
+    r"\bcastor\b|\bk-?631\b|\bk-?631\s*pro\b|"
+    r"\bpollux\b|\bk-?628\b|"
+    r"\bel[fv]\b|\bel[fv]\s*pro\b|\bk-?649\b|"
+    r"\bk-?632\b|\bk-?633\b|\bk-?617\b|\bsindri\b)",
+    re.IGNORECASE
+)
 
 # ---------------------------------------------
 # Utils
@@ -244,8 +292,8 @@ def count_fans(text: str) -> int:
 def product_label(text: str) -> str:
     t = text.lower()
 
-    # ordem por prioridade
-    if GPU_RE.search(t):
+    # prioridade
+    if GPU_TARGET_RE.search(t):
         return "GPU (RTX 5060 / RX 7600)"
     if INTEL_14400F.search(t) or INTEL_12600F_KF.search(t) or INTEL_12400F.search(t) or INTEL_CPU_OK.search(t):
         return "CPU Intel"
@@ -277,74 +325,95 @@ def product_label(text: str) -> str:
         return "RAM DDR4 3200"
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
         return "SSD NVMe M.2 1TB"
+    if REDRAGON_RE.search(t):
+        return "Teclado Redragon"
     return "Produto"
 
 # ---------------------------------------------
-# MATCH LOGIC
+# MATCH LOGIC — retorna ação
 # ---------------------------------------------
-def should_alert(text: str) -> Tuple[bool, str, str]:
+def classify(text: str) -> Tuple[str, str, str, Optional[float]]:
     """
-    Retorna (ok, reason, label)
+    Retorna (action, reason, label, price)
+    action: 'ALERT' | 'BLOQUEADO' | 'IGNORADO'
     """
-    t = text
+    t = text or ""
     price = parse_lowest_price_brl(t)
 
-    # GPU
-    if GPU_RE.search(t):
-        return True, "GPU match (RTX 5060 / RX 7600)", "GPU (RTX 5060 / RX 7600)"
+    # 0) Corta posts de vídeo/redes
+    if is_non_product_post(t):
+        return "IGNORADO", "Post de vídeo/YouTube — ignorar", "Produto", price
 
-    # CPU Intel <= 900
+    # 1) Teclados Redragon — Kumara e superiores
+    if REDRAGON_RE.search(t):
+        if KUMARA_RE.search(t):
+            return "ALERT", "Kumara (K552) — alertar sempre", "Redragon Kumara", price
+
+        if REDRAGON_SUPERIOR_RE.search(t):
+            if price is not None and price <= 160.0:
+                return "ALERT", "Redragon superior ≤ R$160", "Redragon superior", price
+            else:
+                return "BLOQUEADO", "Redragon superior > R$160 — bloquear", "Redragon superior", price
+
+        # Outros Redragon ≠ Kumara
+        if price is not None and price > 160.0:
+            return "BLOQUEADO", "Redragon não-Kumara > R$160 — bloquear", "Teclado Redragon", price
+        else:
+            return "IGNORADO", "Redragon fora dos critérios", "Teclado Redragon", price
+
+    # 2) GPU alvo (RTX 5060 / RX 7600), excluir 5050, preço plausível
+    if GPU_EXCLUDE_RE.search(t):
+        return "IGNORADO", "RTX 5050 explicitamente ignorado", "Produto", price
+    if GPU_TARGET_RE.search(t):
+        if price is None or price < 500 or price > 8000:
+            return "IGNORADO", f"Preço inválido/ausente para GPU alvo (price={price})", "GPU (RTX 5060 / RX 7600)", price
+        return "ALERT", "GPU match (RTX 5060 / RX 7600)", "GPU (RTX 5060 / RX 7600)", price
+
+    # 3) CPU Intel ≤ 900
     if INTEL_14400F.search(t) or INTEL_12600F_KF.search(t) or INTEL_12400F.search(t) or INTEL_CPU_OK.search(t):
         if price is not None and price <= 900:
-            return True, f"CPU <= 900 (R$ {price:.2f})", "CPU Intel"
-        return False, "CPU Intel, mas preço > 900 ou ausente", "CPU Intel"
+            return "ALERT", f"CPU <= 900 (R$ {price:.2f})", "CPU Intel", price
+        return "IGNORADO", "CPU Intel, mas preço > 900 ou ausente", "CPU Intel", price
 
-    # CPU AMD <= 900
+    # 4) CPU AMD ≤ 900
     if AMD_CPU_OK.search(t):
         if price is not None and price <= 900:
-            return True, f"CPU <= 900 (R$ {price:.2f})", "CPU AMD"
-        return False, "CPU AMD, mas preço > 900 ou ausente", "CPU AMD"
+            return "ALERT", f"CPU <= 900 (R$ {price:.2f})", "CPU AMD", price
+        return "IGNORADO", "CPU AMD, mas preço > 900 ou ausente", "CPU AMD", price
 
-    # MOBOS
-    # Bloqueio A520
+    # 5) MOBOS
     if MB_A520_RE.search(t):
-        return False, "A520 bloqueada", "MOBO A520"
+        return "IGNORADO", "A520 bloqueada", "MOBO A520", price
 
-    # B550 ≤ 550 (pedido)
     if MB_AMD_B550_RE.search(t):
         if price is not None and price <= 550:
-            return True, f"MOBO B550 ≤ 550 (R$ {price:.2f})", "MOBO B550"
-        return False, "MOBO B550, mas preço > 550 ou ausente", "MOBO B550"
+            return "ALERT", f"MOBO B550 ≤ 550 (R$ {price:.2f})", "MOBO B550", price
+        return "IGNORADO", "MOBO B550, mas preço > 550 ou ausente", "MOBO B550", price
 
-    # X570 ≤ 680 (mantido)
     if MB_AMD_X570_RE.search(t):
         if price is not None and price <= 680:
-            return True, f"MOBO X570 ≤ 680 (R$ {price:.2f})", "MOBO X570"
-        return False, "MOBO X570, mas preço > 680 ou ausente", "MOBO X570"
+            return "ALERT", f"MOBO X570 ≤ 680 (R$ {price:.2f})", "MOBO X570", price
+        return "IGNORADO", "MOBO X570, mas preço > 680 ou ausente", "MOBO X570", price
 
-    # Intel LGA1700 ≤ 680 (mantido)
     if MB_INTEL_RE.search(t):
         if price is not None and price <= 680:
-            return True, f"MOBO LGA1700 ≤ 680 (R$ {price:.2f})", "MOBO LGA1700"
-        return False, "MOBO LGA1700, mas preço > 680 ou ausente", "MOBO LGA1700"
+            return "ALERT", f"MOBO LGA1700 ≤ 680 (R$ {price:.2f})", "MOBO LGA1700", price
+        return "IGNORADO", "MOBO LGA1700, mas preço > 680 ou ausente", "MOBO LGA1700", price
 
-    # Gabinete
+    # 6) Gabinete
     if GABINETE_RE.search(t):
         fans = count_fans(t)
         if price is None:
-            return False, "Gabinete sem preço", "Gabinete"
-        # Novo: ≥4 fans ≤ 180
+            return "IGNORADO", "Gabinete sem preço", "Gabinete", price
         if fans >= 4 and price <= 180:
-            return True, f"Gabinete ok: {fans} fans ≤ R$ 180 (R$ {price:.2f})", "Gabinete"
-        # Antigo: ≥5 fans ≤ 230
+            return "ALERT", f"Gabinete ok: {fans} fans ≤ R$ 180 (R$ {price:.2f})", "Gabinete", price
         if fans >= 5 and price <= 230:
-            return True, f"Gabinete ok: {fans} fans ≤ R$ 230 (R$ {price:.2f})", "Gabinete"
-        # Bloqueio: <5 fans e <150
+            return "ALERT", f"Gabinete ok: {fans} fans ≤ R$ 230 (R$ {price:.2f})", "Gabinete", price
         if fans < 5 and price < 150:
-            return False, "Gabinete bloqueado: <5 fans e preço < 150", "Gabinete"
-        return False, "Gabinete fora das regras", "Gabinete"
+            return "IGNORADO", "Gabinete bloqueado: <5 fans e preço < 150", "Gabinete", price
+        return "IGNORADO", "Gabinete fora das regras", "Gabinete", price
 
-    # PSU — Bronze/Gold, ≥600W, ≤350
+    # 7) PSU — Bronze/Gold, ≥600W, ≤350
     if PSU_RE.search(t):
         cert_ok = PSU_CERT_RE.search(t) is not None
         watts = None
@@ -356,49 +425,59 @@ def should_alert(text: str) -> Tuple[bool, str, str]:
                 watts = None
         if cert_ok and watts and watts >= 600 and price is not None and price <= 350:
             cert = PSU_CERT_RE.search(t).group(0)
-            return True, f"PSU ok: {watts}W {cert} ≤ R$ 350 (R$ {price:.2f})", "Fonte (PSU)"
-        return False, "PSU fora das regras", "Fonte (PSU)"
+            return "ALERT", f"PSU ok: {watts}W {cert} ≤ R$ 350 (R$ {price:.2f})", "Fonte (PSU)", price
+        return "IGNORADO", "PSU fora das regras", "Fonte (PSU)", price
 
-    # Water cooler < 200
+    # 8) Water cooler < 200
     if WATER_COOLER_RE.search(t):
         if price is not None and price < 200:
-            return True, f"Water cooler < 200 (R$ {price:.2f})", "Water Cooler"
-        return False, "Water cooler >= 200 ou sem preço", "Water Cooler"
+            return "ALERT", f"Water cooler < 200 (R$ {price:.2f})", "Water Cooler", price
+        return "IGNORADO", "Water cooler >= 200 ou sem preço", "Water Cooler", price
 
-    # PS5
+    # 9) PS5
     if PS5_CONSOLE_RE.search(t):
-        return True, "PS5 console", "Console PS5"
+        return "ALERT", "PS5 console", "Console PS5", price
 
-    # iClamper
+    # 10) iClamper
     if ICLAMPER_RE.search(t):
-        return True, "iClamper", "Filtro de linha (iClamper)"
+        return "ALERT", "iClamper", "Filtro de linha (iClamper)", price
 
-    # Kit de fans 3..9
+    # 11) Kit de fans 3..9
     if KIT_FANS_RE.search(t):
         nums = re.findall(r"\b([3-9])\b", t)
         if nums:
-            return True, f"Kit de fans ({'/'.join(nums)} un.)", "Kit de Fans"
+            return "ALERT", f"Kit de fans ({'/'.join(nums)} un.)", "Kit de Fans", price
         fans = count_fans(t)
         if 3 <= fans <= 9:
-            return True, f"Kit de fans ({fans} un.)", "Kit de Fans"
-        return False, "Kit de fans sem quantidade clara (3-9)", "Kit de Fans"
+            return "ALERT", f"Kit de fans ({fans} un.)", "Kit de Fans", price
+        return "IGNORADO", "Kit de fans sem quantidade clara (3-9)", "Kit de Fans", price
 
-    # RAM DDR4 3200 — 8GB ≤ 180; 16GB ≤ 300
+    # 12) RAM DDR4 3200 — 8GB ≤ 180; 16GB ≤ 300
     if RAM_RE.search(t) and DDR4_RE.search(t) and MHZ_3200_RE.search(t):
         if price is not None:
             if GB8_RE.search(t) and price <= 180:
-                return True, f"RAM DDR4 8GB 3200 ≤ 180 (R$ {price:.2f})", "RAM DDR4 8GB 3200"
+                return "ALERT", f"RAM DDR4 8GB 3200 ≤ 180 (R$ {price:.2f})", "RAM DDR4 8GB 3200", price
             if GB16_RE.search(t) and price <= 300:
-                return True, f"RAM DDR4 16GB 3200 ≤ 300 (R$ {price:.2f})", "RAM DDR4 16GB 3200"
-        return False, "RAM DDR4 3200 fora do teto ou sem preço", "RAM DDR4 3200"
+                return "ALERT", f"RAM DDR4 16GB 3200 ≤ 300 (R$ {price:.2f})", "RAM DDR4 16GB 3200", price
+        return "IGNORADO", "RAM DDR4 3200 fora do teto ou sem preço", "RAM DDR4 3200", price
 
-    # SSD NVMe M.2 1TB ≤ 460
+    # 13) SSD NVMe M.2 1TB ≤ 460
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
         if price is not None and price <= 460:
-            return True, f"SSD NVMe M.2 1TB ≤ 460 (R$ {price:.2f})", "SSD NVMe M.2 1TB"
-        return False, "SSD NVMe M.2 1TB > 460 ou sem preço", "SSD NVMe M.2 1TB"
+            return "ALERT", f"SSD NVMe M.2 1TB ≤ 460 (R$ {price:.2f})", "SSD NVMe M.2 1TB", price
+        return "IGNORADO", "SSD NVMe M.2 1TB > 460 ou sem preço", "SSD NVMe M.2 1TB", price
 
-    return False, "sem match", "Produto"
+    return "IGNORADO", "sem match", "Produto", price
+
+# ---------------------------------------------
+# Mensagem enviada ao bot (inclui rodapé com canal)
+# ---------------------------------------------
+def format_bot_message(raw_text: str, channel: str) -> str:
+    ch = channel or ""
+    if ch and not ch.startswith("@"):
+        ch = "@" + ch
+    footer = f"\n\nFonte: {ch}" if ch else ""
+    return f"{raw_text}{footer}"
 
 # ---------------------------------------------
 # ANTI-DUP
@@ -471,24 +550,18 @@ def main():
                 if not raw_text:
                     return
 
-                ok, reason, label = should_alert(raw_text)
+                action, reason, label, price = classify(raw_text)
+
                 chan = getattr(event.chat, "username", None)
                 chan_disp = f"@{chan}" if chan else "(desconhecido)"
 
-                price = parse_lowest_price_brl(raw_text)
+                # LOG
+                _log_event(chan_disp, "MATCH" if action == "ALERT" else ("BLOQUEADO" if action == "BLOQUEADO" else "IGNORADO"), label, price, reason)
 
-                if ok:
-                    if price is not None:
-                        log.info(f"· [{chan_disp: <20}] MATCH    → {label: <22} price={price:.2f} reason={reason}")
-                    else:
-                        log.info(f"· [{chan_disp: <20}] MATCH    → {label: <22} price=None reason={reason}")
-                    # envia exatamente o texto do post
-                    send_alert_to_all(raw_text)
-                else:
-                    if price is not None:
-                        log.info(f"· [{chan_disp: <20}] IGNORADO → {label: <22} price={price:.2f} reason={reason}")
-                    else:
-                        log.info(f"· [{chan_disp: <20}] IGNORADO → {label: <22} price=None reason={reason}")
+                # Envio somente para ALERT
+                if action == "ALERT":
+                    msg = format_bot_message(raw_text, chan or "")
+                    send_alert_to_all(msg)
 
             except Exception as e:
                 log.exception(f"Handler error: {e}")
