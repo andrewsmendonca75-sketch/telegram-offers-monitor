@@ -34,8 +34,7 @@ def require_any(*keys: str) -> str:
 
 def parse_csv_env(key: str) -> List[str]:
     raw = os.getenv(key, "")
-    items = [s.strip() for s in raw.split(",") if s.strip()]
-    return items
+    return [s.strip() for s in raw.split(",") if s.strip()]
 
 # ------------------- Carrega ENV -------------------
 API_ID = int(require_any("TELEGRAM_API_ID", "API_ID"))
@@ -51,7 +50,7 @@ if not dest_list:
 if not dest_list:
     raise RuntimeError("Defina USER_DESTINATIONS (CSV) ou USER_CHAT_ID/DEST_CHAT_ID.")
 
-# Canais: MONITORED_CHANNELS (CSV). Se vazio, usa um default seguro.
+# Canais
 CHANNELS = parse_csv_env("MONITORED_CHANNELS") or [
     "@pcbuildwizard", "@EconoMister", "@TalkPC", "@pcdorafa", "@PCMakerTopOfertas",
     "@promocoesdolock", "@HardTecPromocoes", "@canalandrwss", "@iuriindica",
@@ -79,7 +78,7 @@ WHITELIST_ALWAYS = [
     "ps5", "playstation 5", "playstation5",
     "rtx 5060", "5060 ti", "rx 7600",
     "kumara k552", "k552", "elf pro", "k649", "surara", "k582",
-    "iclamp", "iclamp energia", "iclamp 5t", "clamper", "iclamp energia 5t",
+    "iclamp", "iclamp energia", "iclamp 5t", "clamper",
     "water cooler 120", "fonte 650w 80 plus bronze", "gabinete", "kit de fans", "ventoinhas",
 ]
 BLACKLIST_SNIPPETS = [
@@ -88,20 +87,11 @@ BLACKLIST_SNIPPETS = [
 ]
 RE_PRICE = re.compile(r"R\$\s*([\d\.]{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2})?)", re.IGNORECASE)
 
-AGG_WINDOW_SECONDS = 4.0  # junta mensagens relacionadas por 4s
+AGG_WINDOW_SECONDS = float(os.getenv("AGG_WINDOW_SECONDS", "4.0"))
 
 # -------------------- Cliente TG -------------------
-if STRING_SESSION:
-    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-else:
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-@dataclass
-class Bucket:
-    texts: List[str]
-    timer: Optional[asyncio.Task]
-
-buckets: Dict[int, Bucket] = {}  # channel_id -> Bucket
+client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) if STRING_SESSION \
+    else TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 # -------------------- Utils texto ------------------
 def get_text(msg: Message) -> str:
@@ -119,17 +109,14 @@ def contains_any(text: str, needles) -> bool:
 
 def price_to_float(s: str) -> Optional[float]:
     try:
-        s = s.replace(".", "")        # remove milhares
-        s = s.replace(",", ".")       # vírgula -> decimal
+        s = s.replace(".", "").replace(",", ".")
         return float(s)
     except Exception:
         return None
 
 def extract_first_price(text: str) -> Optional[float]:
     m = RE_PRICE.search(text)
-    if not m:
-        return None
-    return price_to_float(m.group(1))
+    return price_to_float(m.group(1)) if m else None
 
 @dataclass
 class MatchResult:
@@ -217,13 +204,13 @@ def normalized_username(entity) -> str:
 def build_out(full_text: str, source_username: str) -> str:
     return f"{full_text.strip()}\n\nFonte: {source_username}"
 
-# ------------------- Aggregation --------------------
+# ------------------- Aggregation (única) -----------
 @dataclass
 class Bucket:
     texts: List[str]
     timer: Optional[asyncio.Task]
 
-buckets: Dict[int, Bucket] = {}
+buckets: Dict[int, Bucket] = {}  # channel_id -> Bucket
 
 async def flush_bucket(chat_id: int, source: str):
     bucket = buckets.get(chat_id)
@@ -234,18 +221,30 @@ async def flush_bucket(chat_id: int, source: str):
         for dest in dest_list:
             await client.send_message(dest, build_out(text, source))
         logging.info("· envio=ok → destino(s)")
-    if bucket.timer:
-        bucket.timer.cancel()
+    t = bucket.timer
+    if t:
+        try:
+            t.cancel()
+        except Exception:
+            pass
     buckets.pop(chat_id, None)
 
 def schedule_flush(chat_id: int, source: str):
     async def _wait_and_flush():
         await asyncio.sleep(AGG_WINDOW_SECONDS)
         await flush_bucket(chat_id, source)
-    b = buckets[chat_id]
-    if b.timer:
-        b.timer.cancel()
-    b.timer = asyncio.create_task(_wait_and_flush())
+    # usar o loop do Telethon, evita race entre loops
+    if chat_id in buckets and buckets[chat_id].timer:
+        try:
+            buckets[chat_id].timer.cancel()
+        except Exception:
+            pass
+    task = client.loop.create_task(_wait_and_flush())
+    if chat_id not in buckets:
+        buckets[chat_id] = Bucket(texts=[], timer=task)
+    else:
+        buckets[chat_id].timer = task
+    logging.info(f"(agendado flush em {AGG_WINDOW_SECONDS:.1f}s)")
 
 # ------------------- Handler -----------------------
 @client.on(events.NewMessage(chats=CHANNELS))
