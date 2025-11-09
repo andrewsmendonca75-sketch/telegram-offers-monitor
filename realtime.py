@@ -28,18 +28,28 @@ def _pad_channel(ch: str, width: int = 20) -> str:
         ch = "@" + ch
     return f"{ch:<{width}}"
 
-def _log_event(channel: str, action: str, label: str, price: Optional[float], reason: str):
+# ---- Utils: nome curto do produto p/ logs ----
+def _product_name(text: str, maxlen: int = 22) -> str:
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            line = re.sub(r"\s+", " ", line)
+            return (line[:maxlen] + "…") if len(line) > maxlen else line
+    return "Produto"
+
+def _log_event(channel: str, action: str, product_name: str, price: Optional[float], reason: str):
     """
     action: 'MATCH' | 'IGNORADO' | 'BLOQUEADO'
+    product_name: primeira linha do item (nome do produto)
     """
     ch = _pad_channel(channel)
     p = f"{price:.2f}" if isinstance(price, (int, float)) else "None"
     if action == "MATCH":
-        logging.info(f"· [{ch}] MATCH    → {label:<22} price={p} reason={reason}")
+        logging.info(f"· [{ch}] MATCH    → {product_name:<22} price={p} reason={reason}")
     elif action == "BLOQUEADO":
-        logging.info(f"· [{ch}] BLOQUEADO → {label:<22} price={p} reason={reason}")
+        logging.info(f"· [{ch}] BLOQUEADO → {product_name:<22} price={p} reason={reason}")
     else:
-        logging.info(f"· [{ch}] IGNORADO → {label:<22} price={p} reason={reason}")
+        logging.info(f"· [{ch}] IGNORADO → {product_name:<22} price={p} reason={reason}")
 
 # ---------------------------------------------
 # ENV
@@ -131,12 +141,10 @@ def send_alert_to_all(text: str):
                 log.error(f"· Falha ao enviar via bot (depois de retry): {msg}")
 
 # ---------------------------------------------
-# PREÇOS — parser BR (ultrarrobusto)
+# PREÇOS — parser BR (à prova de PS5/8GB)
 # ---------------------------------------------
-# Remove horários (12:34 / 01:02:03) que viram preço 12.34 por engano
 TIME_LIKE_RX = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
 
-# Espaços especiais entre "R$" e o número: NBSP, Narrow NBSP, Thin/Hair Space
 _CURRENCY_WS = "\u00A0\u202F\u2009\u200A\\s"
 
 PRICE_REGEX = re.compile(
@@ -145,6 +153,11 @@ PRICE_REGEX = re.compile(
     r"\d{1,3}(?:[.\s\u00A0\u202F\u2009\u200A]\d{3})*(?:,\d{2})?"  # 1.234,56 com espaços/nbsp
     r"|\d+(?:,\d{2})?"                                      # 179 ou 179,90
     r")",
+    re.IGNORECASE
+)
+
+_UNIT_TOKENS = re.compile(
+    r"^(gb|tb|mhz|hz|w|mm|cm|x|un|und|unid|pins?|pin)$",
     re.IGNORECASE
 )
 
@@ -160,6 +173,22 @@ def _to_float(num: str) -> Optional[float]:
         return None
     return None
 
+def _looks_like_unit_context(text: str, start: int, end: int) -> bool:
+    """
+    Exclui matches que são, na prática, parte de "PS5", "8GB", "120mm", "600W", "3x", etc.
+    - Se houver letra imediatamente ANTES do dígito -> descarta (ex.: 'PS5')
+    - Se houver unidade até ~3 chars depois -> descarta (ex.: '8GB', '120mm', '600 W')
+    """
+    if start > 0 and text[start-1].isalpha():
+        return True
+    tail = text[end:end+6].lower()
+    m = re.match(rf"^[\s\u00A0\u202F\u2009\u200A\-]*([a-z]+)", tail)
+    if m:
+        tok = m.group(1)
+        if _UNIT_TOKENS.match(tok):
+            return True
+    return False
+
 def parse_lowest_price_brl(text: str) -> Optional[float]:
     if not text:
         return None
@@ -170,11 +199,16 @@ def parse_lowest_price_brl(text: str) -> Optional[float]:
 
     scored = []
     for m in matches:
-        full = m.group(0)  # pode conter "R$"
-        num = m.group(1)   # só os dígitos
+        full = m.group(0)
+        num  = m.group(1)
+        start, end = m.span(1)
+        if _looks_like_unit_context(text, start, end):
+            continue
+
         val = _to_float(num)
         if val is None or val < 5:
             continue
+
         score = 1
         if full.strip().lower().startswith("r$"):
             score += 2
@@ -183,7 +217,7 @@ def parse_lowest_price_brl(text: str) -> Optional[float]:
     if not scored:
         return None
 
-    scored.sort(key=lambda x: (-x[0], x[1]))  # melhor score, depois menor valor
+    scored.sort(key=lambda x: (-x[0], x[1]))
     return scored[0][1]
 
 # ---------------------------------------------
@@ -235,6 +269,15 @@ MB_INTEL_RE = re.compile(r"\b(?:h610m?|b660m?|b760m?|z690|z790)\b", re.IGNORECAS
 MB_AMD_B550_RE = re.compile(r"\bb550m?\b", re.IGNORECASE)
 MB_AMD_X570_RE = re.compile(r"\bx570\b", re.IGNORECASE)
 MB_A520_RE = re.compile(r"\ba520m?\b", re.IGNORECASE)
+
+# Mobos "top" (para CORRE!)
+TOP_MOBO_SERIES_RE = re.compile(
+    r"\b("
+    r"tuf\s+gaming|rog\s+strix|aorus\s+(?:elite|pro|master)|steel\s+legend|"
+    r"tomahawk|mortar|edge|carbon|unify|taichi|phantom\s+gaming|proart"
+    r")\b",
+    re.IGNORECASE
+)
 
 # Gabinete
 GABINETE_RE = re.compile(r"\bgabinete\b", re.IGNORECASE)
@@ -308,6 +351,13 @@ REDRAGON_SUPERIOR_RE = re.compile(
     re.IGNORECASE
 )
 
+# CPUs "superiores" p/ CORRE!
+INTEL_SUPERIOR_RE = re.compile(
+    r"\b(?:(?:i5[-\s]*14(?:400|600)f?)|(?:i5[-\s]*13(?:600)k?f?)|i7[-\s]*1[234]\d{2,3}k?f?|i9[-\s]*1[234]\d{2,3}k?f?)\b",
+    re.IGNORECASE
+)
+AMD_SUPERIOR_RE = AMD_CPU_OK  # cobre 5700X e superiores no AM4 high-end
+
 # ---------------------------------------------
 # Utils
 # ---------------------------------------------
@@ -379,21 +429,22 @@ def classify(text: str) -> Tuple[str, str, str, Optional[float]]:
     if is_non_product_post(t):
         return "IGNORADO", "Post de vídeo/YouTube — ignorar", "Produto", price
 
-    # 1) Teclados Redragon — Kumara e superiores
+    # 1) Teclados Redragon — Kumara e superiores (CURTO-CIRCUITO)
     if REDRAGON_RE.search(t):
+        # Kumara alerta SEMPRE
         if KUMARA_RE.search(t):
             return "ALERT", "Kumara (K552) — alertar sempre", "Redragon Kumara", price
 
+        # Superiores (Elf/Elf Pro/K649 etc.)
         if REDRAGON_SUPERIOR_RE.search(t):
             if price is not None and price <= 160.0:
                 return "ALERT", "Redragon superior ≤ R$160", "Redragon superior", price
-            else:
-                return "BLOQUEADO", "Redragon superior > R$160 — bloquear", "Redragon superior", price
+            return "BLOQUEADO", "Redragon superior > R$160 — bloquear", "Redragon superior", price
 
+        # Outros Redragon ≠ Kumara
         if price is not None and price > 160.0:
             return "BLOQUEADO", "Redragon não-Kumara > R$160 — bloquear", "Teclado Redragon", price
-        else:
-            return "IGNORADO", "Redragon fora dos critérios", "Teclado Redragon", price
+        return "IGNORADO", "Redragon fora dos critérios", "Teclado Redragon", price
 
     # 2) GPU alvo (RTX 5060 / RX 7600), excluir 5050, preço plausível
     if GPU_EXCLUDE_RE.search(t):
@@ -505,15 +556,34 @@ def classify(text: str) -> Tuple[str, str, str, Optional[float]]:
 
     return "IGNORADO", "sem match", "Produto", price
 
+# ---- Regras do cabeçalho CORRE! ----
+def should_rush(title_or_chunk: str, label: str, price: Optional[float]) -> bool:
+    t = title_or_chunk or ""
+    # 1) GPU RTX 5060 <= 1900
+    if GPU_TARGET_RE.search(t) and price is not None and price <= 1900:
+        return True
+    # 2) Intel "superior" <= 899 (i5-14400F/14600/13600, i7/i9 12–14th)
+    if INTEL_SUPERIOR_RE.search(t) and price is not None and price <= 899:
+        return True
+    # 3) AMD "superior" <= 899 (Ryzen 7 5700X+)
+    if AMD_SUPERIOR_RE.search(t) and price is not None and price <= 899:
+        return True
+    # 4) Mobo TOP <= 550 para LGA1700 ou B550/X570
+    if price is not None and price <= 550 and TOP_MOBO_SERIES_RE.search(t):
+        if MB_INTEL_RE.search(t) or MB_AMD_B550_RE.search(t) or MB_AMD_X570_RE.search(t):
+            return True
+    return False
+
 # ---------------------------------------------
-# Mensagem enviada ao bot (inclui rodapé com canal)
+# Mensagem enviada ao bot (cabeçalho + rodapé com canal)
 # ---------------------------------------------
-def format_bot_message(raw_text: str, channel: str) -> str:
+def format_bot_message(raw_text: str, channel: str, rush: bool = False) -> str:
     ch = channel or ""
     if ch and not ch.startswith("@"):
         ch = "@" + ch
+    header = "Corre!🔥\n\n" if rush else ""
     footer = f"\n\nFonte: {ch}" if ch else ""
-    return f"{raw_text}{footer}"
+    return f"{header}{raw_text}{footer}"
 
 # ---------------------------------------------
 # ANTI-DUP / LOCKFILE
@@ -535,7 +605,6 @@ class LRUSeen:
 
 seen_cache = LRUSeen(400)
 
-# lockfile simples para evitar 2 instâncias simultâneas
 LOCK_PATH = "/tmp/realtime_session.lock"
 def acquire_lock() -> Optional[int]:
     try:
@@ -611,16 +680,18 @@ def main():
                     for chunk in split_items(raw_text):
                         action, reason, label, price = classify(chunk)
 
-                        # LOG por item
+                        # LOG com nome do produto (primeira linha)
+                        pname = _product_name(chunk)
                         _log_event(
                             chan_disp,
                             "MATCH" if action == "ALERT" else ("BLOQUEADO" if action == "BLOQUEADO" else "IGNORADO"),
-                            label, price, reason
+                            pname, price, reason
                         )
 
                         # Envia somente nos itens que deram ALERT
                         if action == "ALERT":
-                            msg = format_bot_message(chunk, chan or "")
+                            rush = should_rush(chunk, label, price)
+                            msg = format_bot_message(chunk, chan or "", rush=rush)
                             send_alert_to_all(msg)
 
                 except Exception as e:
