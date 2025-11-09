@@ -1,466 +1,483 @@
+# realtime.py
+# -*- coding: utf-8 -*-
 import os
 import re
-import asyncio
-import logging
+import time
 import json
-from typing import List, Optional, Tuple, Dict, Any
+import logging
+from typing import List, Optional, Tuple, Dict, Set
 
-from telethon import TelegramClient, events
+import requests
+from telethon import events
 from telethon.sessions import StringSession
-from telethon.tl.types import User, Channel, Chat
+from telethon.sync import TelegramClient
 
-import urllib.parse
-import http.client
-
-# ---------------------------------------------------------
-# Log
-# ---------------------------------------------------------
+# ---------------------------------------------
+# LOGGING
+# ---------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("realtime")
+log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------
-# ENVs
-# ---------------------------------------------------------
-API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
-API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
-STRING_SESSION = os.environ.get("TELEGRAM_STRING_SESSION", "").strip()
+# ---------------------------------------------
+# ENV
+# ---------------------------------------------
+API_ID = int(os.environ["TELEGRAM_API_ID"])
+API_HASH = os.environ["TELEGRAM_API_HASH"]
+STRING_SESSION = os.environ["TELEGRAM_STRING_SESSION"]
+BOT_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
-BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-USER_CHAT_ID = os.environ.get("USER_CHAT_ID", "").strip()
+# Canais a monitorar (usernames, separados por vírgula). Ex.: "@talkpc,@pcdorafa,..."
+MONITORED_CHANNELS_RAW = os.getenv("MONITORED_CHANNELS", "")
+# Destinos para onde enviar o alerta. Pode ser número (chat id) ou @canal (se o bot for admin).
+# Ex.: "1818469361,@TalkPC"
+USER_DESTINATIONS_RAW = os.getenv("USER_DESTINATIONS", os.getenv("USER_CHAT_ID", ""))
 
-RAW_CHANNELS = os.environ.get("MONITORED_CHANNELS", "").strip()
+# Timeout básico de retries no envio pelo bot
+BOT_RETRY = int(os.getenv("BOT_RETRY", "2"))
 
-if not API_ID or not API_HASH or not STRING_SESSION:
-    raise RuntimeError("Faltam TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_STRING_SESSION nas ENVs.")
-
-if not BOT_TOKEN or not USER_CHAT_ID:
-    raise RuntimeError("Faltam TELEGRAM_TOKEN / USER_CHAT_ID nas ENVs.")
-
-# Sanitiza canais: aceita somente @usernames (sem IDs numéricos soltos)
-def _parse_channels(raw: str) -> List[str]:
-    if not raw:
+# ---------------------------------------------
+# HELPERS — normalização de listas do ENV
+# ---------------------------------------------
+def _split_list(val: str) -> List[str]:
+    if not val:
         return []
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    valid = []
-    for p in parts:
-        # Aceita @username (ou sem @, só letras/números/underscore)
-        if p.startswith("@"):
-            uname = p
-        else:
-            # normaliza para @username se vier sem @
-            uname = "@" + p
+    parts = [p.strip() for p in val.split(",") if p.strip()]
+    return parts
 
-        # filtra óbvios inválidos (IDs, números)
-        if re.fullmatch(r"@[\w\d_]{3,64}", uname) and not re.fullmatch(r"@\d+", uname):
-            valid.append(uname.lower())
-        else:
-            log.warning(f"Ignorando entrada inválida em MONITORED_CHANNELS: {p}")
-    # remove duplicados preservando ordem
-    seen = set()
-    out = []
-    for v in valid:
-        if v not in seen:
-            out.append(v)
-            seen.add(v)
-    return out
+def _norm_username(u: str) -> Optional[str]:
+    if not u:
+        return None
+    u = u.strip()
+    if not u:
+        return None
+    # Se for um número/ID, não é username de canal
+    if re.fullmatch(r"\d+", u):
+        return None
+    # Normaliza para @lowercase (Telethon resolve case-insensitive)
+    u = u.lower()
+    if not u.startswith("@"):
+        u = "@"+u
+    return u
 
-MONITORED_CHANNELS: List[str] = _parse_channels(RAW_CHANNELS)
-
-if not MONITORED_CHANNELS:
+MONITORED_USERNAMES: List[str] = []
+for x in _split_list(MONITORED_CHANNELS_RAW):
+    nu = _norm_username(x)
+    if nu:
+        MONITORED_USERNAMES.append(nu)
+if not MONITORED_USERNAMES:
     log.warning("MONITORED_CHANNELS vazio — nada será filtrado (handler ouvirá tudo, mas filtrará por 0 canais).")
     log.info("▶️ Canais: (nenhum)")
 else:
-    log.info("▶️ Canais: " + ", ".join(MONITORED_CHANNELS))
+    log.info(f"▶️ Canais: {', '.join(MONITORED_USERNAMES)}")
 
-# ---------------------------------------------------------
-# Bot sender (sem parse_mode)
-# ---------------------------------------------------------
-def _http_post_json(host: str, path: str, payload: Dict[str, Any]) -> Tuple[int, str]:
-    body = json.dumps(payload)
-    headers = {
-        "Content-Type": "application/json",
-        "Connection": "close",
-        "User-Agent": "offer-monitor/1.0"
-    }
-    conn = http.client.HTTPSConnection(host, timeout=15)
-    try:
-        conn.request("POST", path, body=body, headers=headers)
-        resp = conn.getresponse()
-        data = resp.read().decode("utf-8", errors="replace")
-        return resp.status, data
-    finally:
-        conn.close()
+USER_DESTINATIONS: List[str] = _split_list(USER_DESTINATIONS_RAW)
+if not USER_DESTINATIONS:
+    log.warning("USER_DESTINATIONS/USER_CHAT_ID não definido; nada será enviado.")
+else:
+    log.info(f"📬 Destinos: {', '.join(USER_DESTINATIONS)}")
 
-def send_via_bot(text: str) -> bool:
-    token = BOT_TOKEN
-    chat_id = USER_CHAT_ID
-    host = "api.telegram.org"
-    path = f"/bot{urllib.parse.quote(token)}/sendMessage"
+# ---------------------------------------------
+# TELEGRAM BOT API
+# ---------------------------------------------
+BOT_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+def bot_send_text(dest: str, text: str) -> Tuple[bool, str]:
+    """
+    Envia texto via Bot API, sem parse_mode (evita 'unsupported parse_mode').
+    'dest' pode ser chat_id numérico ou @username (se o bot for admin no canal).
+    """
     payload = {
-        "chat_id": int(chat_id),
+        "chat_id": dest,
         "text": text,
-        # não definir parse_mode para evitar "unsupported parse_mode"
-        "disable_web_page_preview": False,
-        "disable_notification": False
+        "disable_web_page_preview": True,
+        # NÃO usar parse_mode para evitar 'unsupported parse_mode' com textos arbitrários.
     }
-    status, data = _http_post_json(host, path, payload)
-    if status != 200:
-        log.error(f"Falha ao enviar via bot ({status}): {data}")
-        return False
     try:
-        jd = json.loads(data)
-        ok = bool(jd.get("ok"))
-        if not ok:
-            log.error(f"Falha ao enviar via bot (API): {data}")
-        return ok
-    except Exception:
-        log.error(f"Resposta inválida do bot: {data}")
-        return False
+        r = requests.post(f"{BOT_BASE}/sendMessage", json=payload, timeout=20)
+        if r.status_code == 200 and r.json().get("ok"):
+            return True, "ok"
+        return False, r.text
+    except Exception as e:
+        return False, repr(e)
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-CURRENCY_RE = re.compile(
-    r"""
-    (?:
-        (?<!\w)R\$\s*        # prefixo R$
-        ([\d\.\s]+,\d{2}|\d+(?:\.\d{3})+|\d+)
-    )
-    """,
-    re.VERBOSE | re.IGNORECASE
-)
-
-# também captura "POR: 999", "PREÇO: 199" etc (sem confundir IDs de link)
-BARE_PRICE_RE = re.compile(
-    r"""
-    (?:
-        (?:(?:por|preco|preço|valor|pix|vista|à\s*vista)\s*[:=]?\s*)?
-        (?:R\$\s*)?
-        (\d{1,3}(?:[\.\s]\d{3})*(?:,\d{2})?|\d{2,})(?!\d)  # 99 / 1.299 / 1 299 / 1.299,90
-    )
-    """,
-    re.VERBOSE | re.IGNORECASE
-)
-
-def parse_price(text: str) -> Optional[float]:
-    """
-    Procura primeiro 'R$ ...'. Se não achar, tenta padrões "por/preço/valor ...".
-    Converte vírgula decimal e ignora separador de milhar.
-    Retorna menor preço plausível encontrado (normalmente o à vista).
-    """
-    candidates: List[float] = []
-
-    def _to_float(num: str) -> Optional[float]:
-        s = num.strip()
-        # remove espaços de milhar
-        s = re.sub(r"\s", "", s)
-        # se houver ambos '.' e ',', assume '.' milhar e ',' decimal
-        if "," in s:
-            s = s.replace(".", "").replace(",", ".")
+def send_alert_to_all(text: str):
+    for dest in USER_DESTINATIONS:
+        ok, msg = bot_send_text(dest, text)
+        if ok:
+            log.info("· envio=ok → destino=bot")
         else:
-            # só ponto → pode ser milhar (1.299) ou decimal (89.99). Se tem mais que 1 ponto, tira pontos.
-            if s.count(".") > 1:
+            log.error(f"· ERRO envio via bot: {msg}")
+            # retry simples
+            for _ in range(BOT_RETRY):
+                time.sleep(0.6)
+                ok, msg = bot_send_text(dest, text)
+                if ok:
+                    log.info("· envio=ok (retry) → destino=bot")
+                    break
+            if not ok:
+                log.error(f"· Falha ao enviar via bot (depois de retry): {msg}")
+
+# ---------------------------------------------
+# PARSER DE PREÇO (robusto p/ BR)
+# ---------------------------------------------
+PRICE_REGEX = re.compile(
+    r"""
+    (?:
+        (?:r\$\s*)?                # opcional "R$"
+        (?:
+            \d{1,3}(?:\.\d{3})+    # 1.234 ou 12.345.678
+            (?:,\d{2})?            # ,99
+          | \d+(?:,\d{2})?         # 89 ou 89,90
+          | \d+\.\d{2}             # 89.90 (alguns posts)
+        )
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+def _to_float(num: str) -> Optional[float]:
+    s = num.strip()
+    s = re.sub(r"\s+", "", s)
+
+    if "," in s:
+        # Formato BR: 3.199,90 → 3199.90
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        if "." in s:
+            parts = s.split(".")
+            if len(parts) == 2:
+                left, right = parts
+                # Heurística: se direita tem 3 dígitos e esquerda é número, é milhar BR (3.199 => 3199)
+                if right.isdigit() and len(right) == 3 and left.isdigit():
+                    s = left + right
+                else:
+                    # 89.90 provável decimal; mantém
+                    pass
+            else:
+                # Muitos pontos → milhares: remove todos
                 s = s.replace(".", "")
-        try:
-            val = float(s)
-            # ignora valores absurdos (> 100k)
-            if 0 < val < 100000:
-                return val
-        except Exception:
-            return None
+    try:
+        val = float(s)
+        if 0 < val < 100000:
+            return val
+    except Exception:
         return None
-
-    for m in CURRENCY_RE.finditer(text):
-        v = _to_float(m.group(1))
-        if v is not None:
-            candidates.append(v)
-
-    if not candidates:
-        # Tenta capturas mais genéricas, mas vamos filtrar para não pegar ID aleatório
-        for m in BARE_PRICE_RE.finditer(text):
-            raw = m.group(1)
-            # ignora números curtos que parecem quantidade (ex: 12X, 3 fans) — mantemos >= 2 dígitos, mas já está no regex
-            v = _to_float(raw)
-            if v is not None:
-                candidates.append(v)
-
-    if not candidates:
-        return None
-
-    # Heurística: menor preço costuma ser o à vista
-    return min(candidates)
-
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip().lower()
-
-def has_words(text: str, *words: str) -> bool:
-    t = norm(text)
-    return all(w.lower() in t for w in words)
-
-def any_word(text: str, *words: str) -> bool:
-    t = norm(text)
-    return any(w.lower() in t for w in words)
-
-def count_fans(text: str) -> Optional[int]:
-    """
-    Tenta inferir qtde de fans/ventoinhas a partir do texto: '3x', 'kit 5 fans', '4 cooler/fan', etc.
-    """
-    t = text.lower()
-    # padrões tipo "3x120", "5x fan"
-    m = re.search(r'(\d+)\s*(?:x|unid|uni|fans?|coolers?|ventoinhas?)', t)
-    if m:
-        try:
-            n = int(m.group(1))
-            if 1 <= n <= 12:
-                return n
-        except Exception:
-            pass
-    # "kit com 6" ou "com 6 fans"
-    m = re.search(r'kit.*?(?:com\s*)?(\d+)\s*(?:fans?|coolers?|ventoinhas?)', t)
-    if m:
-        try:
-            n = int(m.group(1))
-            if 1 <= n <= 12:
-                return n
-        except Exception:
-            pass
     return None
 
-# ---------------------------------------------------------
-# Filtros de produtos
-# ---------------------------------------------------------
-CPU_INTEL_ALLOWED_RE = re.compile(
-    r'\b(?:i5[-\s]?12600k?f?|i5[-\s]?14400f|i5[-\s]?14\d{3}[k|kf|f]?|i7[-\s]?14\d{3}[k|kf|f]?|i9[-\s]?14\d{3}[k|kf|f]?)\b',
-    re.IGNORECASE
+def parse_lowest_price_brl(text: str) -> Optional[float]:
+    """
+    Encontra o menor preço plausível no texto.
+    Usamos o menor porque posts às vezes listam antigo e atual; quase sempre o menor é o da oferta.
+    """
+    candidates: List[float] = []
+    for m in PRICE_REGEX.finditer(text):
+        raw = m.group(0)
+        # remove prefixo R$
+        raw_num = re.sub(r"(?i)^r\$\s*", "", raw).strip()
+        val = _to_float(raw_num)
+        if val is not None:
+            candidates.append(val)
+    if not candidates:
+        return None
+    # descarta valores centesimais muito baixos (erros de OCR tipo 3.199 => 3.20)
+    cleaned = [v for v in candidates if v >= 5.0]
+    if not cleaned:
+        cleaned = candidates
+    return min(cleaned) if cleaned else None
+
+# ---------------------------------------------
+# REGRAS (REGEX)
+# ---------------------------------------------
+
+# GPUs
+GPU_RE = re.compile(r"\b(?:rtx\s*5060|rx\s*7600)\b", re.IGNORECASE)
+
+# CPUs Intel (alertar 14400F/KF e “superiores” comuns; inclui 12600F/KF que você pediu)
+INTEL_CPU_OK = re.compile(
+    r"""\b(?:
+        i5[-\s]*12(?:600|700)k?f?   |   # i5-12600(F/KF), i5-12700(KF) (acima de 12400F)
+        i5[-\s]*13(?:400|500|600)k?f? |
+        i5[-\s]*14(?:400|500|600)k?f? |
+        i7[-\s]*12(?:700|900)k?f? |
+        i7[-\s]*13(?:700|900)k?f? |
+        i7[-\s]*14(?:700|900)k?f? |
+        i9[-\s]*\d{4,5}k?f?
+    )\b""",
+    re.IGNORECASE | re.VERBOSE
+)
+INTEL_12400F = re.compile(r"\bi5[-\s]*12400f\b", re.IGNORECASE)  # você quis permitir
+INTEL_12600F_KF = re.compile(r"\bi5[-\s]*12600k?f?\b", re.IGNORECASE)  # 12600F/KF
+INTEL_14400F = re.compile(r"\bi5[-\s]*14400k?f?\b", re.IGNORECASE)
+
+# CPUs AMD (Ryzen 7 5700 / 5700X e superiores clássicos AM4)
+AMD_CPU_OK = re.compile(
+    r"""\b(?:
+        ryzen\s*7\s*5700x?     |
+        ryzen\s*7\s*5800x3?d?  |
+        ryzen\s*9\s*5900x      |
+        ryzen\s*9\s*5950x
+    )\b""",
+    re.IGNORECASE | re.VERBOSE
 )
 
-CPU_AMD_ALLOWED_RE = re.compile(
-    r'\b(?:ryzen\s*7\s*(?:5700x?|5800x3d|5800x|5900x|5950x))\b',
-    re.IGNORECASE
+# Placas-mãe (Intel LGA1700) — aceitar M opcional e limitar preço <= 680
+MB_INTEL_RE = re.compile(r"\b(?:h610m?|b660m?|b760m?|z690|z790)\b", re.IGNORECASE)
+# Placas-mãe (AMD AM4) — B550/X570 (A520 explicitamente NÃO)
+MB_AMD_RE = re.compile(r"\b(?:b550m?|x570)\b", re.IGNORECASE)
+MB_A520_RE = re.compile(r"\ba520m?\b", re.IGNORECASE)  # para bloquear
+
+# Gabinete — heurística para contagem de fans
+FAN_COUNT_RE = re.compile(
+    r"""(?:
+        (?:(\d+)\s*(?:fans?|coolers?|ventoinhas?)) |
+        (?:(\d+)\s*x\s*120\s*mm) |
+        (?:(\d+)\s*x\s*fan)
+    )""",
+    re.IGNORECASE | re.VERBOSE
 )
 
-MB_INTEL_RE = re.compile(r'\b(?:h610|b660|b760|z690|z790)\b', re.IGNORECASE)
-MB_AMD_OK_RE = re.compile(r'\b(?:b550|x570)\b', re.IGNORECASE)
-MB_AMD_BLOCK_RE = re.compile(r'\b(?:a520)\b', re.IGNORECASE)
+GABINETE_RE = re.compile(r"\bgabinete\b", re.IGNORECASE)
 
-GPU_OK_RE = re.compile(r'\b(?:rtx\s*5060|rx\s*7600)\b', re.IGNORECASE)
+# PSU — somente Bronze/Gold >= 600W e <= 350
+PSU_RE = re.compile(r"\b(?:fonte|psu)\b", re.IGNORECASE)
+PSU_CERT_RE = re.compile(r"\b(?:80\s*\+?\s*plus\s*)?(?:bronze|gold)\b", re.IGNORECASE)
+PSU_WATTS_RE = re.compile(r"\b(\d{3,4})\s*w\b", re.IGNORECASE)
 
-PSU_RE = re.compile(r'\b(?:80\s*\+?\s*plus\s*)?(?:bronze|gold)\b', re.IGNORECASE)
-WATT_RE = re.compile(r'(\d{3,4})\s*w', re.IGNORECASE)
+# Water cooler — apenas <= 200
+WATER_COOLER_RE = re.compile(r"\bwater\s*cooler\b", re.IGNORECASE)
 
-REDRAGON_RE = re.compile(r'\bredragon\b', re.IGNORECASE)
-KUMARA_RE = re.compile(r'\b(k552|kumara)\b', re.IGNORECASE)
+# PS5 console (para permitir alertar console)
+PS5_CONSOLE_RE = re.compile(r"\bplaystation\s*5\b|\bps5\b", re.IGNORECASE)
 
-PS5_CONSOLE_RE = re.compile(r'\b(?:ps5|playstation\s*5)\b', re.IGNORECASE)
-PS5_BLOCK_RE = re.compile(r'\b(?:capa|cover|case|controle|controller|dualsense|jogo|game|mídia|midia|card|gift)\b', re.IGNORECASE)
+# Filtro de linha iClamper
+ICLAMPER_RE = re.compile(r"\biclamper\b|\bclamp(?:er)?\b", re.IGNORECASE)
 
-ICLAMPER_RE = re.compile(r'\b(?:iclamp(?:er)?|filtro\s*de\s*linha)\b', re.IGNORECASE)
-KIT_FANS_RE = re.compile(r'\b(?:kit|conjunto).*(?:fan|cooler|ventoinha)', re.IGNORECASE)
+# Kits de fans — números de 3 a 9
+KIT_FANS_RE = re.compile(r"\b(?:kit\s*(?:de\s*)?(?:fans?|ventoinhas?)|ventoinhas?\s*kit)\b", re.IGNORECASE)
 
-def is_cpu_allowed(text: str, price: Optional[float]) -> bool:
-    if price is None:
-        return False
-    t = text.lower()
-    if CPU_INTEL_ALLOWED_RE.search(t):
-        return price <= 900.0
-    if CPU_AMD_ALLOWED_RE.search(t):
-        return price <= 900.0
-    return False
+# Redragon teclados superiores ao Kumara por <= 160 (heurística simples: Redragon presente e NÃO conter 'Kumara')
+REDRAGON_KB_RE = re.compile(r"\bredragon\b", re.IGNORECASE)
+KUMARA_RE = re.compile(r"\bkumara\b", re.IGNORECASE)
 
-def is_mobo_allowed(text: str, price: Optional[float]) -> bool:
-    if price is None:
-        return False
-    t = text.lower()
-    if MB_AMD_BLOCK_RE.search(t):
-        return False
-    if MB_INTEL_RE.search(t):
-        return price <= 680.0
-    if MB_AMD_OK_RE.search(t):
-        return price <= 680.0
-    # B550 “qualquer” foi pedido no começo, mas consolidamos com teto 680
-    return False
+# ---------------------------------------------
+# MATCH LOGIC
+# ---------------------------------------------
+def count_fans(text: str) -> int:
+    count = 0
+    for m in FAN_COUNT_RE.finditer(text):
+        nums = [n for n in m.groups() if n]
+        for n in nums:
+            try:
+                v = int(n)
+                count = max(count, v)
+            except:
+                pass
+    return count
 
-def is_gpu_allowed(text: str, price: Optional[float]) -> bool:
-    # Enviar RTX 5060 e RX 7600 independente de preço
-    return GPU_OK_RE.search(text) is not None
+def should_alert(text: str) -> Tuple[bool, str]:
+    t = text
 
-def is_psu_allowed(text: str, price: Optional[float]) -> bool:
-    if price is None:
-        return False
-    if not PSU_RE.search(text):
-        return False
-    m = WATT_RE.search(text)
-    watts_ok = False
-    if m:
-        try:
-            w = int(m.group(1))
-            watts_ok = (w >= 600)
-        except Exception:
-            watts_ok = False
-    return watts_ok and (price <= 350.0)
+    # GPUs (RTX 5060 / RX 7600) — sem preço mínimo específico
+    if GPU_RE.search(t):
+        return True, "GPU match (RTX 5060 / RX 7600)"
 
-def is_wc_allowed(text: str, price: Optional[float]) -> bool:
-    if price is None:
-        return False
-    return any_word(text, "water", "cooler") and (price <= 200.0)
+    # CPUs — preço <= 900
+    price = parse_lowest_price_brl(t)
 
-def is_case_allowed(text: str, price: Optional[float]) -> bool:
-    """
-    Regras:
-     - Bloqueia gabinetes "sem fans" OU "< 5 fans" se preço < 150.
-     - Alerta se possui >= 5 fans E preço <= 230.
-     - Demais, ignora.
-    """
-    t = text.lower()
-    if not any_word(t, "gabinete", "case", "cabinet"):
-        return False
+    # Intel: 14400F/KF ou superiores comuns + 12600F/KF + 12400F (permitido)
+    if (
+        INTEL_14400F.search(t)
+        or INTEL_12600F_KF.search(t)
+        or INTEL_12400F.search(t)
+        or INTEL_CPU_OK.search(t)
+    ):
+        if price is not None and price <= 900:
+            return True, f"CPU <= 900 (R$ {price:.2f})"
+        else:
+            return False, "CPU Intel, mas preço > 900 ou ausente"
 
-    n = count_fans(t)  # pode ser None
-    if price is None:
-        return False
+    # AMD: Ryzen 7 5700 / 5700X e superiores
+    if AMD_CPU_OK.search(t):
+        if price is not None and price <= 900:
+            return True, f"CPU <= 900 (R$ {price:.2f})"
+        else:
+            return False, "CPU AMD, mas preço > 900 ou ausente"
 
-    # pista textual "sem fan"
-    no_fans = "sem fan" in t or "sem cooler" in t or "sem ventoinha" in t
+    # MOBOS Intel/AMD ≤ 680 (bloquear A520 sempre)
+    if MB_A520_RE.search(t):
+        return False, "A520 bloqueada"
 
-    if (no_fans or (n is not None and n < 5)) and (price < 150.0):
-        return False  # bloqueia
+    if MB_INTEL_RE.search(t) or MB_AMD_RE.search(t):
+        if price is not None and price <= 680:
+            return True, f"MOBO <= 680 (R$ {price:.2f})"
+        else:
+            return False, "MOBO, mas preço > 680 ou ausente"
 
-    if (n is not None and n >= 5) and (price <= 230.0):
-        return True  # alerta
+    # GABINETE regra:
+    # - Bloquear: sem fans ou <5 fans por menos de 150
+    # - Alertar: até 230 com 5 fans ou mais
+    if GABINETE_RE.search(t):
+        fans = count_fans(t)
+        if price is None:
+            return False, "gabinete sem preço"
+        if fans >= 5 and price <= 230:
+            return True, f"gabinete ok: {fans} fans ≤ R$ 230 (R$ {price:.2f})"
+        if price < 150 and fans < 5:
+            return False, "gabinete bloqueado: <5 fans e preço < 150"
+        return False, "gabinete fora das regras"
 
-    return False
+    # PSU (fonte) — somente Bronze/Gold, >= 600W, ≤ 350
+    if PSU_RE.search(t):
+        cert_ok = PSU_CERT_RE.search(t) is not None
+        watts = None
+        m = PSU_WATTS_RE.search(t)
+        if m:
+            try:
+                watts = int(m.group(1))
+            except:
+                watts = None
+        if cert_ok and watts and watts >= 600 and price is not None and price <= 350:
+            return True, f"PSU ok: {watts}W {PSU_CERT_RE.search(t).group(0)} ≤ R$ 350 (R$ {price:.2f})"
+        else:
+            return False, "PSU fora das regras"
 
-def is_fans_kit(text: str) -> bool:
-    # kits de 3 a 9 fans
-    if KIT_FANS_RE.search(text) or any_word(text, "kit", "fans", "coolers", "ventoinhas"):
-        n = count_fans(text)
-        if n is not None and (3 <= n <= 9):
+    # Water cooler <= 200
+    if WATER_COOLER_RE.search(t):
+        if price is not None and price <= 200:
+            return True, f"Water cooler ≤ 200 (R$ {price:.2f})"
+        return False, "Water cooler > 200 ou sem preço"
+
+    # PS5 console — sempre alertar (só replica o texto)
+    if PS5_CONSOLE_RE.search(t):
+        return True, "PS5 console"
+
+    # Filtro de linha iClamper — sempre alertar
+    if ICLAMPER_RE.search(t):
+        return True, "iClamper"
+
+    # Kit de fans (3 a 9 unidades)
+    if KIT_FANS_RE.search(t):
+        # checar se menciona 3..9
+        nums = re.findall(r"\b([3-9])\b", t)
+        if nums:
+            return True, f"kit de fans ({'/'.join(nums)} un.)"
+        # fallback: se mencionar "3x120" etc, o count_fans já pegou
+        fans = count_fans(t)
+        if 3 <= fans <= 9:
+            return True, f"kit de fans ({fans} un.)"
+        return False, "kit de fans sem quantidade clara (3-9)"
+
+    # Redragon superiores ao Kumara <= 160
+    if REDRAGON_KB_RE.search(t):
+        if not KUMARA_RE.search(t):
+            if price is not None and price <= 160:
+                return True, f"Redragon (não Kumara) ≤ 160 (R$ {price:.2f})"
+            else:
+                return False, "Redragon > 160 ou sem preço"
+        else:
+            # Kumara só alerta se você quiser; pelas regras novas, só “superiores ao Kumara”.
+            return False, "Kumara bloqueado (apenas superiores)"
+
+    # Sem match
+    return False, "sem match"
+
+# ---------------------------------------------
+# CACHE anti-duplicado
+# ---------------------------------------------
+class LRUSeen:
+    def __init__(self, maxlen: int = 300):
+        self.maxlen = maxlen
+        self.set: Dict[int, float] = {}
+
+    def seen(self, msg_id: int) -> bool:
+        if msg_id in self.set:
             return True
-    return False
-
-def is_iclamper(text: str) -> bool:
-    return ICLAMPER_RE.search(text) is not None
-
-def is_redragon_kb(text: str, price: Optional[float]) -> bool:
-    if price is None:
+        # manutenção simples
+        if len(self.set) > self.maxlen:
+            # remove os mais antigos
+            items = sorted(self.set.items(), key=lambda kv: kv[1])[: self.maxlen // 2]
+            for k, _ in items:
+                self.set.pop(k, None)
+        self.set[msg_id] = time.time()
         return False
-    if not REDRAGON_RE.search(text):
-        return False
-    # Qualquer Redragon até 160 (independe de ser Kumara/K552)
-    return price <= 160.0
 
-def is_ps5_console(text: str) -> bool:
-    return PS5_CONSOLE_RE.search(text) is not None and not PS5_BLOCK_RE.search(text)
+seen_cache = LRUSeen(400)
 
-def decide(text: str) -> Tuple[bool, str, Optional[float]]:
-    """
-    Retorna (enviar?, motivo, preço_detectado)
-    """
-    price = parse_price(text)
-
-    # Ordem de checagem por prioridade
-    if is_cpu_allowed(text, price):
-        return True, f"CPU <= 900 (R$ {price:.2f})", price
-    if is_mobo_allowed(text, price):
-        return True, f"MOBO <= 680 (R$ {price:.2f})", price
-    if is_gpu_allowed(text, price):
-        return True, "GPU match (RTX 5060 / RX 7600)", price
-    if is_psu_allowed(text, price):
-        return True, f"PSU Bronze/Gold >=600W <=350 (R$ {price:.2f})", price
-    if is_wc_allowed(text, price):
-        return True, f"Water Cooler <= 200 (R$ {price:.2f})", price
-    if is_case_allowed(text, price):
-        return True, f"Gabinete ≥5 fans e ≤230 (R$ {price:.2f})", price
-    if is_fans_kit(text):
-        return True, "Kit de fans (3 a 9 unid.)", price
-    if is_iclamper(text):
-        return True, "Filtro de linha iCLAMPER", price
-    if is_ps5_console(text):
-        return True, "PS5 console", price
-
-    # Não enviar
-    return False, "sem match", price
-
-# ---------------------------------------------------------
-# Main
-# ---------------------------------------------------------
-client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-
-async def resolve_channels(client: TelegramClient, wanted: List[str]) -> List[Any]:
-    """
-    Constrói lista de entidades a partir de @usernames.
-    Usa get_dialogs para aquecer cache e resolver corretamente.
-    """
-    await client.get_dialogs()  # aquece cache
-    resolved = []
-    missing = []
-    for uname in wanted:
-        try:
-            ent = await client.get_entity(uname)
-            resolved.append(ent)
-        except Exception:
-            missing.append(uname)
-    if missing:
-        log.warning("Não foi possível resolver alguns canais: " + ", ".join(missing))
-    return resolved
-
-def render_message(channel_username: str, raw_text: str) -> str:
-    """
-    Envia a oferta 'como está' + uma linha de contexto do canal.
-    (Sem 'Preço encontrado', sem parse_mode)
-    """
-    header = f"🔥 Alerta em {channel_username}\n\n"
-    return f"{header}{raw_text.strip()}"
-
-async def main():
-    async with client:
+# ---------------------------------------------
+# MAIN
+# ---------------------------------------------
+def main():
+    log.info("Conectando ao Telegram...")
+    with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
         log.info("Conectado.")
-        # Resolve canais
-        chats_to_watch = []
-        if MONITORED_CHANNELS:
-            entities = await resolve_channels(client, MONITORED_CHANNELS)
-            chats_to_watch = entities
+
+        # Warm cache — garante que get_dialogs popula entidades
+        dialogs = client.get_dialogs()
+        # Mapa @username -> entity
+        username_to_entity = {}
+        for d in dialogs:
+            try:
+                if d.entity and getattr(d.entity, "username", None):
+                    username_to_entity["@{}".format(d.entity.username.lower())] = d.entity
+            except Exception:
+                pass
+
+        # Resolve canais a partir dos usernames
+        resolved_entities = []
+        for uname in MONITORED_USERNAMES:
+            ent = username_to_entity.get(uname)
+            if ent is None:
+                log.warning(f"Canal não encontrado (ignorado): {uname}")
+            else:
+                resolved_entities.append(ent)
+
+        if resolved_entities:
             log.info("▶️ Canais resolvidos: " + ", ".join(
-                [f"@{e.username}" for e in entities if isinstance(e, Channel) and e.username] +
-                [str(getattr(e, 'title', '')) for e in entities if not (isinstance(e, Channel) and e.username)]
+                f"@{getattr(e, 'username', '')}" for e in resolved_entities if getattr(e, "username", None)
             ))
         else:
             log.info("▶️ Canais resolvidos: ")
-
-        @client.on(events.NewMessage(chats=chats_to_watch if chats_to_watch else None))
-        async def handler(event: events.NewMessage.Event):
-            try:
-                chat = await event.get_chat()
-                if isinstance(chat, (Channel, Chat, User)):
-                    uname = f"@{getattr(chat, 'username', None)}" if getattr(chat, 'username', None) else getattr(chat, 'title', 'desconhecido')
-                else:
-                    uname = "desconhecido"
-
-                text = event.raw_text or ""
-                send, reason, price = decide(text)
-
-                pr_log = f"price={price:.2f}" if isinstance(price, (int, float)) and price is not None else "price=None"
-                log.info(f"· [{uname:<20}] {'match' if send else 'ignorado (sem match)'} → {pr_log} reason={reason}")
-
-                if send:
-                    out = render_message(uname, text)
-                    ok = send_via_bot(out)
-                    if ok:
-                        log.info("· envio=ok → destino=bot")
-                    else:
-                        log.error("· envio=erro → destino=bot")
-            except Exception as e:
-                log.exception(f"Erro no handler: {e}")
-
+        log.info(f"✅ Logado — monitorando {len(resolved_entities)} canais…")
         log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
-        await client.run_until_disconnected()
+
+        # Handler — só eventos vindos dos canais resolvidos
+        @client.on(events.NewMessage(chats=resolved_entities if resolved_entities else None))
+        async def handler(event):
+            try:
+                # Dup guard
+                if seen_cache.seen(event.id):
+                    return
+
+                raw_text = (event.raw_text or "").strip()
+                if not raw_text:
+                    return
+
+                ok, reason = should_alert(raw_text)
+                chan = getattr(event.chat, "username", None)
+                chan_disp = f"@{chan}" if chan else "(desconhecido)"
+
+                price = parse_lowest_price_brl(raw_text)
+                if ok:
+                    if price is not None:
+                        log.info(f"· [{chan_disp: <20}] match → price={price:.2f} reason={reason}")
+                    else:
+                        log.info(f"· [{chan_disp: <20}] match → price=None reason={reason}")
+
+                    # Envia exatamente como está (sem cabeçalho e sem parse_mode)
+                    send_alert_to_all(raw_text)
+                else:
+                    if price is not None:
+                        log.info(f"· [{chan_disp: <20}] ignorado (sem match) → price={price:.2f} reason={reason}")
+                    else:
+                        log.info(f"· [{chan_disp: <20}] ignorado (sem match) → price=None reason={reason}")
+
+            except Exception as e:
+                log.exception(f"Handler error: {e}")
+
+        client.run_until_disconnected()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("✅ Encerrado.")
+    main()
