@@ -10,6 +10,7 @@ import requests
 from telethon import events
 from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 
 # ---------------------------------------------
 # LOGGING
@@ -130,25 +131,27 @@ def send_alert_to_all(text: str):
                 log.error(f"· Falha ao enviar via bot (depois de retry): {msg}")
 
 # ---------------------------------------------
-# PREÇOS — parser BR (robusto)
+# PREÇOS — parser BR (ultrarrobusto)
 # ---------------------------------------------
+# Remove horários (12:34 / 01:02:03) que viram preço 12.34 por engano
 TIME_LIKE_RX = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
+
+# Espaços especiais entre "R$" e o número: NBSP, Narrow NBSP, Thin/Hair Space
+_CURRENCY_WS = "\u00A0\u202F\u2009\u200A\\s"
+
 PRICE_REGEX = re.compile(
-    r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2})|\d+\.\d{2})",
+    rf"(?:r\${_CURRENCY_WS}*)?"                              # R$ (opcional) + espaços
+    r"("                                                    # captura apenas o número
+    r"\d{1,3}(?:[.\s\u00A0\u202F\u2009\u200A]\d{3})*(?:,\d{2})?"  # 1.234,56 com espaços/nbsp
+    r"|\d+(?:,\d{2})?"                                      # 179 ou 179,90
+    r")",
     re.IGNORECASE
 )
 
 def _to_float(num: str) -> Optional[float]:
-    s = re.sub(r"\s+", "", num.strip())
-    if "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        if "." in s:
-            parts = s.split(".")
-            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and len(parts[1]) == 3:
-                s = parts[0] + parts[1]
-            elif len(parts) > 2:
-                s = s.replace(".", "")
+    s = num
+    s = re.sub(r"[.\s\u00A0\u202F\u2009\u200A]", "", s)  # remove milhar e espaços
+    s = s.replace(",", ".")
     try:
         v = float(s)
         if 0 < v < 100000:
@@ -160,7 +163,6 @@ def _to_float(num: str) -> Optional[float]:
 def parse_lowest_price_brl(text: str) -> Optional[float]:
     if not text:
         return None
-    # remove horários (ex.: "6:00") que viram preço 6.00 por engano
     text = TIME_LIKE_RX.sub("", text)
     matches = list(PRICE_REGEX.finditer(text))
     if not matches:
@@ -168,20 +170,49 @@ def parse_lowest_price_brl(text: str) -> Optional[float]:
 
     scored = []
     for m in matches:
-        raw = m.group(0)
-        val = _to_float(m.group(1))
+        full = m.group(0)  # pode conter "R$"
+        num = m.group(1)   # só os dígitos
+        val = _to_float(num)
         if val is None or val < 5:
             continue
         score = 1
-        if raw.lower().strip().startswith("r$"):
+        if full.strip().lower().startswith("r$"):
             score += 2
         scored.append((score, val))
 
     if not scored:
         return None
 
-    scored.sort(key=lambda x: (-x[0], x[1]))  # melhor score e menor valor
+    scored.sort(key=lambda x: (-x[0], x[1]))  # melhor score, depois menor valor
     return scored[0][1]
+
+# ---------------------------------------------
+# SPLIT — divide mensagens com vários itens
+# ---------------------------------------------
+SPLIT_BLANKS = re.compile(r"(?:\r?\n\s*\r?\n)+", re.UNICODE)
+
+def split_items(msg: str) -> List[str]:
+    if not msg:
+        return []
+    parts = [p.strip() for p in SPLIT_BLANKS.split(msg) if p.strip()]
+    out = []
+    for p in parts:
+        price_hits = list(PRICE_REGEX.finditer(p))
+        if len(price_hits) >= 2:
+            current = []
+            for line in p.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                current.append(line)
+                if "r$" in line.lower() or PRICE_REGEX.search(line):
+                    out.append("\n".join(current).strip())
+                    current = []
+            if current:
+                out.append("\n".join(current).strip())
+        else:
+            out.append(p)
+    return out
 
 # ---------------------------------------------
 # REGEX — categorias/produtos
@@ -240,6 +271,9 @@ GB8_RE = re.compile(r"\b8\s*gb\b", re.IGNORECASE)
 GB16_RE = re.compile(r"\b16\s*gb\b", re.IGNORECASE)
 MHZ_3200_RE = re.compile(r"\b(?:3200\s*mhz|3200mhz|3200)\b", re.IGNORECASE)
 
+# RAM notebook (bloqueio)
+NOTEBOOK_RAM_BLOCK_RE = re.compile(r"\b(?:notebook|laptop|so-?dimm|sodimm|260\s*pin|260p)\b", re.IGNORECASE)
+
 # SSD NVMe M.2 1TB
 SSD_RE = re.compile(r"\bssd\b", re.IGNORECASE)
 M2_RE = re.compile(r"\b(?:m\.?2|m2|nvme|nv3)\b", re.IGNORECASE)
@@ -292,7 +326,6 @@ def count_fans(text: str) -> int:
 def product_label(text: str) -> str:
     t = text.lower()
 
-    # prioridade
     if GPU_TARGET_RE.search(t):
         return "GPU (RTX 5060 / RX 7600)"
     if INTEL_14400F.search(t) or INTEL_12600F_KF.search(t) or INTEL_12400F.search(t) or INTEL_CPU_OK.search(t):
@@ -318,6 +351,8 @@ def product_label(text: str) -> str:
     if KIT_FANS_RE.search(t):
         return "Kit de Fans"
     if RAM_RE.search(t) and DDR4_RE.search(t) and MHZ_3200_RE.search(t):
+        if NOTEBOOK_RAM_BLOCK_RE.search(t):
+            return "RAM DDR4 3200 (notebook)"
         if GB16_RE.search(t):
             return "RAM DDR4 16GB 3200"
         if GB8_RE.search(t):
@@ -355,7 +390,6 @@ def classify(text: str) -> Tuple[str, str, str, Optional[float]]:
             else:
                 return "BLOQUEADO", "Redragon superior > R$160 — bloquear", "Redragon superior", price
 
-        # Outros Redragon ≠ Kumara
         if price is not None and price > 160.0:
             return "BLOQUEADO", "Redragon não-Kumara > R$160 — bloquear", "Teclado Redragon", price
         else:
@@ -452,8 +486,10 @@ def classify(text: str) -> Tuple[str, str, str, Optional[float]]:
             return "ALERT", f"Kit de fans ({fans} un.)", "Kit de Fans", price
         return "IGNORADO", "Kit de fans sem quantidade clara (3-9)", "Kit de Fans", price
 
-    # 12) RAM DDR4 3200 — 8GB ≤ 180; 16GB ≤ 300
+    # 12) RAM DDR4 3200 — Desktop only
     if RAM_RE.search(t) and DDR4_RE.search(t) and MHZ_3200_RE.search(t):
+        if NOTEBOOK_RAM_BLOCK_RE.search(t):
+            return "IGNORADO", "RAM notebook/SODIMM — ignorar", "RAM DDR4 3200 (notebook)", price
         if price is not None:
             if GB8_RE.search(t) and price <= 180:
                 return "ALERT", f"RAM DDR4 8GB 3200 ≤ 180 (R$ {price:.2f})", "RAM DDR4 8GB 3200", price
@@ -480,7 +516,7 @@ def format_bot_message(raw_text: str, channel: str) -> str:
     return f"{raw_text}{footer}"
 
 # ---------------------------------------------
-# ANTI-DUP
+# ANTI-DUP / LOCKFILE
 # ---------------------------------------------
 class LRUSeen:
     def __init__(self, maxlen: int = 400):
@@ -499,74 +535,102 @@ class LRUSeen:
 
 seen_cache = LRUSeen(400)
 
+# lockfile simples para evitar 2 instâncias simultâneas
+LOCK_PATH = "/tmp/realtime_session.lock"
+def acquire_lock() -> Optional[int]:
+    try:
+        import fcntl
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except Exception:
+        return None
+
 # ---------------------------------------------
 # MAIN
 # ---------------------------------------------
 def main():
+    # Evita 2 processos simultâneos usando a MESMA sessão
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        log.error("Outra instância já está rodando com esta sessão. Abortando para evitar AuthKeyDuplicatedError.")
+        return
+
     log.info("Conectando ao Telegram...")
-    with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
-        log.info("Conectado.")
+    try:
+        with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
+            log.info("Conectado.")
 
-        # Warm cache
-        dialogs = client.get_dialogs()
-        username_to_entity = {}
-        for d in dialogs:
-            try:
-                if d.entity and getattr(d.entity, "username", None):
-                    username_to_entity["@{}".format(d.entity.username.lower())] = d.entity
-            except Exception:
-                pass
-
-        # Resolve canais (com fallback get_entity, mesmo sem estar inscrito)
-        resolved_entities = []
-        for uname in MONITORED_USERNAMES:
-            ent = username_to_entity.get(uname)
-            if ent is None:
+            # Warm cache
+            dialogs = client.get_dialogs()
+            username_to_entity = {}
+            for d in dialogs:
                 try:
-                    ent = client.get_entity(uname)
+                    if d.entity and getattr(d.entity, "username", None):
+                        username_to_entity["@{}".format(d.entity.username.lower())] = d.entity
                 except Exception:
-                    ent = None
-            if ent is None:
-                log.warning(f"Canal não encontrado (ignorado): {uname}")
+                    pass
+
+            # Resolve canais (com fallback get_entity, mesmo sem estar inscrito)
+            resolved_entities = []
+            for uname in MONITORED_USERNAMES:
+                ent = username_to_entity.get(uname)
+                if ent is None:
+                    try:
+                        ent = client.get_entity(uname)
+                    except Exception:
+                        ent = None
+                if ent is None:
+                    log.warning(f"Canal não encontrado (ignorado): {uname}")
+                else:
+                    resolved_entities.append(ent)
+
+            if resolved_entities:
+                log.info("▶️ Canais resolvidos: " + ", ".join(
+                    f"@{getattr(e, 'username', '')}" for e in resolved_entities if getattr(e, "username", None)
+                ))
             else:
-                resolved_entities.append(ent)
+                log.info("▶️ Canais resolvidos: ")
+            log.info(f"✅ Logado — monitorando {len(resolved_entities)} canais…")
+            log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
 
-        if resolved_entities:
-            log.info("▶️ Canais resolvidos: " + ", ".join(
-                f"@{getattr(e, 'username', '')}" for e in resolved_entities if getattr(e, "username", None)
-            ))
-        else:
-            log.info("▶️ Canais resolvidos: ")
-        log.info(f"✅ Logado — monitorando {len(resolved_entities)} canais…")
-        log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
+            @client.on(events.NewMessage(chats=resolved_entities if resolved_entities else None))
+            async def handler(event):
+                try:
+                    if seen_cache.seen(event.id):
+                        return
 
-        @client.on(events.NewMessage(chats=resolved_entities if resolved_entities else None))
-        async def handler(event):
-            try:
-                if seen_cache.seen(event.id):
-                    return
+                    raw_text = (event.raw_text or "").strip()
+                    if not raw_text:
+                        return
 
-                raw_text = (event.raw_text or "").strip()
-                if not raw_text:
-                    return
+                    chan = getattr(event.chat, "username", None)
+                    chan_disp = f"@{chan}" if chan else "(desconhecido)"
 
-                action, reason, label, price = classify(raw_text)
+                    # Divide a mensagem em itens e processa cada um
+                    for chunk in split_items(raw_text):
+                        action, reason, label, price = classify(chunk)
 
-                chan = getattr(event.chat, "username", None)
-                chan_disp = f"@{chan}" if chan else "(desconhecido)"
+                        # LOG por item
+                        _log_event(
+                            chan_disp,
+                            "MATCH" if action == "ALERT" else ("BLOQUEADO" if action == "BLOQUEADO" else "IGNORADO"),
+                            label, price, reason
+                        )
 
-                # LOG
-                _log_event(chan_disp, "MATCH" if action == "ALERT" else ("BLOQUEADO" if action == "BLOQUEADO" else "IGNORADO"), label, price, reason)
+                        # Envia somente nos itens que deram ALERT
+                        if action == "ALERT":
+                            msg = format_bot_message(chunk, chan or "")
+                            send_alert_to_all(msg)
 
-                # Envio somente para ALERT
-                if action == "ALERT":
-                    msg = format_bot_message(raw_text, chan or "")
-                    send_alert_to_all(msg)
+                except Exception as e:
+                    log.exception(f"Handler error: {e}")
 
-            except Exception as e:
-                log.exception(f"Handler error: {e}")
+            client.run_until_disconnected()
 
-        client.run_until_disconnected()
+    except AuthKeyDuplicatedError:
+        log.error("AuthKeyDuplicatedError: a mesma StringSession está ativa em outro host/instância. Encerre a outra ou gere nova STRING_SESSION.")
+        return
 
 if __name__ == "__main__":
     main()
