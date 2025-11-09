@@ -81,7 +81,7 @@ class BotSender:
                         log.error(f"Falha ao enviar para {chat_id}: HTTP {r.status} — {body}")
 
 def split_telegram(text: str, maxlen: int) -> List[str]:
-    if len(text) <= maxlen: 
+    if len(text) <= maxlen:
         return [text]
     out, cur = [], ""
     for ln in text.splitlines(True):
@@ -97,25 +97,31 @@ bot_sender = BotSender(BOT_TOKEN)
 # ---------------------------
 # Regras de parsing/match
 # ---------------------------
+
+# Agora **exige** "R$" antes do número
 PRICE_RE = re.compile(
-    r"(?:R\$\s*|(?<!\d))(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2})?)(?!\d)",
+    r"R\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2})?)",
     flags=re.IGNORECASE
 )
 
 def br_to_float(s: str) -> Optional[float]:
     s = s.strip().replace(".", "").replace(",", ".")
-    try: return float(s)
-    except: return None
+    try:
+        return float(s)
+    except:
+        return None
 
 def extract_prices(txt: str) -> List[float]:
     vals = []
     for m in PRICE_RE.finditer(txt):
         v = br_to_float(m.group(1))
-        if v is not None: vals.append(v)
+        if v is not None:
+            vals.append(v)
     return vals
 
 def any_price_leq(txt: str, limit: float) -> bool:
-    return any(p <= limit for p in extract_prices(txt))
+    prices = extract_prices(txt)
+    return any(p <= limit for p in prices)
 
 def contains_any(txt: str, terms: List[str]) -> bool:
     t = txt.lower()
@@ -124,41 +130,54 @@ def contains_any(txt: str, terms: List[str]) -> bool:
 # Regras alvo
 def matches_rules(txt: str) -> bool:
     t = txt.lower()
-    # 1) PS5 Slim Digital (qualquer preço aceitável — você pediu esse alvo)
+    # 1) PS5 Slim Digital
     if contains_any(t, ["playstation 5", "ps5"]) and contains_any(t, ["slim", "edição digital", "digital"]):
         return True
-    # 2) GPUs alvo (exemplo)
+    # 2) GPUs alvo
     if contains_any(t, ["rtx 5060", "5060 ti", "rx 7600"]):
         return True
     # 3) RAM DDR4 8GB 3200 ≤ 180
     if contains_any(t, ["ddr4"]) and contains_any(t, ["8gb", "8 gb"]) and contains_any(t, ["3200"]):
-        if any_price_leq(t, 180.0): return True
+        if any_price_leq(t, 180.0): 
+            return True
+        else:
+            return False
     # 4) SSD NVMe 1TB ≤ 460
     if contains_any(t, ["nvme", "m.2"]) and contains_any(t, ["1tb", "1 tb", "1 tera", "1tera"]):
-        if any_price_leq(t, 460.0): return True
+        if any_price_leq(t, 460.0): 
+            return True
+        else:
+            return False
     # 5) Placas-mãe
     if contains_any(t, ["b550"]) and any_price_leq(t, 550.0): return True
     if contains_any(t, ["x570"]) and any_price_leq(t, 680.0): return True
     if contains_any(t, ["lga1700"]) and any_price_leq(t, 680.0): return True
     # 6) CPU ≤ 900
-    if contains_any(t, ["ryzen", "intel core", "i3-", "i5-", "i7-", "i9-"]) and any_price_leq(t, 900.0):
-        return True
+    if contains_any(t, ["ryzen", "intel core", "i3-", "i5-", "i7-", "i9-"]):
+        if any_price_leq(t, 900.0):
+            return True
+        else:
+            return False
     # 7) Gabinete 4+ fans ≤ 180
-    if contains_any(t, ["gabinete"]) and contains_any(t, ["4 fan", "4fan", "4 fans", "quatro fans"]) and any_price_leq(t, 180.0):
-        return True
+    if contains_any(t, ["gabinete"]) and contains_any(t, ["4 fan", "4fan", "4 fans", "quatro fans"]):
+        if any_price_leq(t, 180.0):
+            return True
+        else:
+            return False
     # 8) PSUs
     if contains_any(t, ["fonte", "psu", "power supply"]):
         if contains_any(t, ["650w", "750w"]) and contains_any(t, ["80 plus bronze", "bronze"]) and any_price_leq(t, 350.0):
             return True
         if contains_any(t, ["750w", "850w", "1000w", "1200w"]) and contains_any(t, ["80 plus gold", "gold"]) and any_price_leq(t, 350.0):
             return True
-    # 9) iClamper
+        return False
+    # 9) iClamper (sempre)
     if "iclamper" in t:
         return True
-    # 10) Redragon (exemplos)
-    if "redragon" in t and contains_any(t, ["kumara", "k552"]): 
+    # 10) Redragon
+    if "redragon" in t and contains_any(t, ["kumara", "k552"]):
         return True
-    if "redragon" in t and contains_any(t, ["elf pro", "k649"]) and any_price_leq(t, 160.0): 
+    if "redragon" in t and contains_any(t, ["elf pro", "k649"]) and any_price_leq(t, 160.0):
         return True
     return False
 
@@ -171,10 +190,14 @@ HEADER_HINT = re.compile(
 
 def looks_like_header(line: str) -> bool:
     l = (line or "").strip()
-    if not l: return False
-    if HEADER_HINT.search(l): return True
-    # títulos comuns sem emoji
-    if len(l) <= 120 and any(w in l.lower() for w in ["console", "processador", "placa", "fonte", "gabinete", "ssd", "memória", "memoria"]):
+    if not l:
+        return False
+    if HEADER_HINT.search(l):
+        return True
+    if len(l) <= 120 and any(w in l.lower() for w in [
+        "console","processador","placa","fonte","gabinete","ssd","memória","memoria",
+        "monitor","teclado","mouse","headset","notebook","kit"
+    ]):
         return True
     return False
 
@@ -198,7 +221,7 @@ def join_block(lines: List[str]) -> str:
     out = []
     for t in lines:
         t = (t or "").rstrip()
-        if not t: 
+        if not t:
             out.append("\n")
         else:
             out.append(t + ("\n" if not t.endswith("\n") else ""))
@@ -207,12 +230,12 @@ def join_block(lines: List[str]) -> str:
 async def flush_block(chat_id: int, display_source: str):
     acc = accums.get(chat_id)
     if not acc or not acc.lines:
-        accums.pop(chat_id, None); 
+        accums.pop(chat_id, None)
         return
 
     block = join_block(acc.lines)
 
-    # Validação FINAL do bloco (garante que só envia se o bloco em si passa nas regras)
+    # Validação FINAL do bloco
     if acc.any_match and matches_rules(block):
         payload = f"{block}\n\nFonte: {display_source}"
         for dest in USER_DESTINATIONS:
@@ -269,29 +292,43 @@ async def main():
             async def handler(event):
                 try:
                     chat_id = event.chat_id
+
+                    # **Corrige fonte -100…**: resolve nome/título dinamicamente se necessário
+                    if chat_id not in names_map:
+                        try:
+                            ent = await event.get_chat()
+                            username = getattr(ent, "username", None)
+                            title = getattr(ent, "title", None)
+                            if username:
+                                names_map[chat_id] = f"@{username}"
+                            elif isinstance(ent, (Channel, Chat)) and title:
+                                names_map[chat_id] = title
+                            else:
+                                names_map[chat_id] = str(chat_id)
+                        except Exception:
+                            names_map[chat_id] = str(chat_id)
+
                     display_source = names_map.get(chat_id, str(chat_id))
                     text = sanitize_text(event.message.message or event.raw_text or "")
-                    if not text: 
+                    if not text:
                         return
 
-                    # Se chegou um NOVO CABEÇALHO e já havia linhas acumuladas, faz flush do bloco anterior
+                    # Se chegou um NOVO CABEÇALHO e já havia linhas acumuladas, flush do bloco anterior
                     if looks_like_header(text) and accums[chat_id].lines:
-                        # cancela debounce anterior e flush imediato do bloco anterior
                         if accums[chat_id].task and not accums[chat_id].task.done():
                             accums[chat_id].task.cancel()
-                            try: 
+                            try:
                                 await accums[chat_id].task
-                            except: 
+                            except:
                                 pass
-                        await flush_block(chat_id, display_source)  # só envia se passar nas regras
+                        await flush_block(chat_id, display_source)
 
-                    # (Re)cria se tiver sido limpo no flush
-                    acc = accums[chat_id]  # defaultdict garante
+                    acc = accums[chat_id]  # defaultdict
 
                     # Acumula a linha atual
                     acc.lines.append(text)
 
-                    # Marca se essa linha isoladamente casa regras (para acelerar decisão)
+                    # Marca se essa linha isoladamente casa regras (com preço real, por causa do "R$")
                     line_match = matches_rules(text)
                     acc.any_match = acc.any_match or line_match
 
@@ -302,9 +339,9 @@ async def main():
                     # Reagenda flush deste bloco
                     if acc.task and not acc.task.done():
                         acc.task.cancel()
-                        try: 
+                        try:
                             await acc.task
-                        except: 
+                        except:
                             pass
                     acc.task = asyncio.create_task(schedule_flush(chat_id, display_source))
 
@@ -329,7 +366,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Encerrado por KeyboardInterrupt.")
-    except AuthKeyDuplicatedError:
+    except AuthKeyDuplicicatedError:
         log.error(
             "AuthKeyDuplicicatedError: sessão usada em outro IP simultaneamente. "
             "Gere nova STRING_SESSION e use só nesta instância."
