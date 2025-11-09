@@ -41,7 +41,7 @@ API_ID = int(require_any("TELEGRAM_API_ID", "API_ID"))
 API_HASH = require_any("TELEGRAM_API_HASH", "API_HASH")
 STRING_SESSION = getenv_any("TELEGRAM_STRING_SESSION", "STRING_SESSION", default=None)
 
-# Destinos: primeiro USER_DESTINATIONS (CSV), depois USER_CHAT_ID, depois DEST_CHAT_ID
+# Destinos
 dest_list = parse_csv_env("USER_DESTINATIONS")
 if not dest_list:
     one = getenv_any("USER_CHAT_ID", "DEST_CHAT_ID")
@@ -85,7 +85,12 @@ BLACKLIST_SNIPPETS = [
     "saiu vídeo", "review no youtube", "inscreva-se no nosso canal",
     "link do vídeo", "assista no youtube", "estreia no youtube",
 ]
-RE_PRICE = re.compile(r"R\$\s*([\d\.]{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2})?)", re.IGNORECASE)
+
+# preços: captura 1+ valores, ex: R$ 2.970,90 | R$ 2999 | 2.999,00
+RE_PRICE_ALL = re.compile(
+    r"R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2})?)",
+    re.IGNORECASE,
+)
 
 AGG_WINDOW_SECONDS = float(os.getenv("AGG_WINDOW_SECONDS", "4.0"))
 
@@ -114,14 +119,22 @@ def price_to_float(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def extract_first_price(text: str) -> Optional[float]:
-    m = RE_PRICE.search(text)
-    return price_to_float(m.group(1)) if m else None
+def extract_prices(text: str) -> List[float]:
+    vals = []
+    for m in RE_PRICE_ALL.findall(text):
+        v = price_to_float(m)
+        if v is not None:
+            vals.append(v)
+    return vals
 
 @dataclass
 class MatchResult:
     matched: bool
     reason: str
+
+def is_continuation_hint(text: str) -> bool:
+    t = text.lower()
+    return ("r$" in t) or ("cupom" in t) or ("http" in t) or ("link do produto" in t) or ("➡️" in t) or ("✅" in t)
 
 def rule_match(text: str) -> MatchResult:
     t = text.lower()
@@ -132,7 +145,8 @@ def rule_match(text: str) -> MatchResult:
     if contains_any(t, WHITELIST_ALWAYS):
         return MatchResult(True, "Whitelist forte (produto alvo)")
 
-    price = extract_first_price(text)
+    prices = extract_prices(text)
+    price = max(prices) if prices else None
 
     if ("ddr4" in t and "8gb" in t and "3200" in t):
         if price is not None and price <= PRICE_LIMITS["ram_ddr4_8gb_3200"]:
@@ -204,22 +218,23 @@ def normalized_username(entity) -> str:
 def build_out(full_text: str, source_username: str) -> str:
     return f"{full_text.strip()}\n\nFonte: {source_username}"
 
-# ------------------- Aggregation (única) -----------
+# ------------------- Aggregation -------------------
 @dataclass
 class Bucket:
     texts: List[str]
     timer: Optional[asyncio.Task]
+    source: str
 
-buckets: Dict[int, Bucket] = {}  # channel_id -> Bucket
+buckets: Dict[int, Bucket] = {}  # chat_id -> Bucket
 
-async def flush_bucket(chat_id: int, source: str):
+async def flush_bucket(chat_id: int):
     bucket = buckets.get(chat_id)
     if not bucket:
         return
     text = "\n".join(bucket.texts).strip()
     if text:
         for dest in dest_list:
-            await client.send_message(dest, build_out(text, source))
+            await client.send_message(dest, build_out(text, bucket.source))
         logging.info("· envio=ok → destino(s)")
     t = bucket.timer
     if t:
@@ -229,52 +244,57 @@ async def flush_bucket(chat_id: int, source: str):
             pass
     buckets.pop(chat_id, None)
 
-def schedule_flush(chat_id: int, source: str):
+def schedule_flush(chat_id: int):
     async def _wait_and_flush():
         await asyncio.sleep(AGG_WINDOW_SECONDS)
-        await flush_bucket(chat_id, source)
-    # usar o loop do Telethon, evita race entre loops
+        await flush_bucket(chat_id)
+
+    # reprograma
     if chat_id in buckets and buckets[chat_id].timer:
         try:
             buckets[chat_id].timer.cancel()
         except Exception:
             pass
     task = client.loop.create_task(_wait_and_flush())
-    if chat_id not in buckets:
-        buckets[chat_id] = Bucket(texts=[], timer=task)
-    else:
+    if chat_id in buckets:
         buckets[chat_id].timer = task
-    logging.info(f"(agendado flush em {AGG_WINDOW_SECONDS:.1f}s)")
 
 # ------------------- Handler -----------------------
 @client.on(events.NewMessage(chats=CHANNELS))
 async def handler(event: events.NewMessage.Event):
     try:
         msg: Message = event.message
-        channel = await event.get_chat()
-        chat_id = getattr(channel, "id", None)
-        source = normalized_username(channel)
         text = get_text(msg)
-
         if not text:
-            logging.info(f"[{source:<20}] IGNORADO → (sem texto/legenda)")
+            logging.info(f"[{event.chat.username if event.chat else 'Canal':<20}] IGNORADO → (sem texto/legenda)")
             return
 
-        # Se já existe bucket aberto para esse canal, acumula e reprograma flush
+        chat_id = event.chat_id
+        source = normalized_username(await event.get_chat())
+
+        # Se já existe bucket aberto para esse canal → acumula e reprograma flush
         if chat_id in buckets:
             buckets[chat_id].texts.append(text)
-            schedule_flush(chat_id, source)
+            schedule_flush(chat_id)
             logging.info(f"[{source:<20}] +ACUMULANDO → {text[:40].replace(chr(10),' ')}…")
             return
 
-        # Primeiro contato: decide se abre bucket (MATCH) ou ignora
+        # 1) Tenta regra de match
         mr = rule_match(text)
         if mr.matched:
             logging.info(f"[{source:<20}] MATCH    → {text[:40].replace(chr(10),' ')}… reason={mr.reason}")
-            buckets[chat_id] = Bucket(texts=[text], timer=None)
-            schedule_flush(chat_id, source)
-        else:
-            logging.info(f"[{source:<20}] IGNORADO → {text[:40].replace(chr(10),' ')}… reason={mr.reason}")
+            buckets[chat_id] = Bucket(texts=[text], timer=None, source=source)
+            schedule_flush(chat_id)
+            return
+
+        # 2) Heurística: primeiro pedaço parece continuação (preço/cupom/link) → abre bucket mesmo sem match
+        if is_continuation_hint(text):
+            logging.info(f"[{source:<20}] START CTN → {text[:40].replace(chr(10),' ')}… reason=continuação (preço/cupom/link)")
+            buckets[chat_id] = Bucket(texts=[text], timer=None, source=source)
+            schedule_flush(chat_id)
+            return
+
+        logging.info(f"[{source:<20}] IGNORADO → {text[:40].replace(chr(10),' ')}… reason={mr.reason}")
 
     except Exception as e:
         logging.exception(f"Erro no handler: {e}")
