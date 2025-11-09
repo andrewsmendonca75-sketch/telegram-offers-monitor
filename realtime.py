@@ -5,7 +5,7 @@ import asyncio, logging, os, re, sys
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
-from telethon import events, TelegramClient
+from telethon import events, TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 from telethon.tl.types import Channel, Chat
@@ -33,12 +33,10 @@ API_HASH = require_env("TELEGRAM_API_HASH", "API_HASH")
 STRING_SESSION = require_env("TELEGRAM_STRING_SESSION", "STRING_SESSION")
 BOT_TOKEN = require_env("TELEGRAM_TOKEN", "BOT_TOKEN")
 
-# usernames liberados (sem @)
 CHANNEL_USERNAMES = [c.strip().lstrip("@").lower()
                      for c in optional_env("MONITORED_CHANNELS","").split(",") if c.strip()]
 
-# NOVO: IDs liberados (ex.: -1003286562822,-1002063152651)
-MONITORED_IDS = []
+MONITORED_IDS: List[int] = []
 _raw_ids = optional_env("MONITORED_IDS", "")
 if _raw_ids:
     for x in _raw_ids.split(","):
@@ -46,10 +44,11 @@ if _raw_ids:
         if not x: continue
         try:
             MONITORED_IDS.append(int(x))
-        except:  # permite “-100…”
+        except:
             pass
 
 ALLOW_ANY = optional_env("ALLOW_ANY","false").lower() in ("1","true","yes")
+KILL_OTHERS = optional_env("KILL_OTHER_SESSIONS","false").lower() in ("1","true","yes")
 
 DESTS_RAW = optional_env("USER_DESTINATIONS", optional_env("USER_CHAT_ID",""))
 USER_DESTINATIONS = [int(x.strip()) for x in DESTS_RAW.split(",") if x.strip()]
@@ -94,40 +93,54 @@ def any_price_leq(txt: str, limit: float) -> bool:
 
 def contains_any(txt: str, terms: List[str]) -> bool:
     t = txt.lower()
-    return any(term.lower() in t for term in terms)
+    return any(term.lower() in t for t in [txt] for term in terms)
 
 def matches_rules(txt: str) -> bool:
     t = txt.lower()
-    if contains_any(t, ["playstation 5","ps5"]) and contains_any(t, ["slim","edição digital","digital"]): return True
-    if contains_any(t, ["rtx 5060","5060 ti","rx 7600"]): return True
-    if "iclamper" in t: return True
+
+    # Alvos diretos
+    if ("playstation 5" in t or "ps5" in t) and ("slim" in t or "edição digital" in t or "digital" in t):
+        return True
+    if "rtx 5060" in t or "5060 ti" in t or "rx 7600" in t:
+        return True
+    if "iclamper" in t:
+        return True
 
     # CPU ≤ 900
-    if contains_any(t, ["ryzen","intel core","i3-","i5-","i7-","i9-"]) and any_price_leq(t, 900): return True
+    if any(x in t for x in ["ryzen","intel core","i3-","i5-","i7-","i9-"]) and any_price_leq(t, 900):
+        return True
 
     # SSD NVMe 1TB ≤ 460
-    if contains_any(t, ["nvme","m.2"]) and contains_any(t, ["1tb","1 tb","1 tera","1tera"]) and any_price_leq(t, 460): return True
+    if (("nvme" in t or "m.2" in t) and any(x in t for x in ["1tb","1 tb","1 tera","1tera"]) and any_price_leq(t, 460)):
+        return True
 
     # RAM DDR4 8GB 3200 ≤ 180
-    if "ddr4" in t and contains_any(t, ["8gb","8 gb"]) and "3200" in t and any_price_leq(t, 180): return True
+    if ("ddr4" in t and any(x in t for x in ["8gb","8 gb"]) and "3200" in t and any_price_leq(t, 180)):
+        return True
 
     # Placas-mãe
-    if "a520" in t and any_price_leq(t, 320): return True
-    if "b550" in t and any_price_leq(t, 550): return True
-    if "x570" in t and any_price_leq(t, 680): return True
-    if "lga1700" in t and any_price_leq(t, 680): return True
+    if ("a520" in t and any_price_leq(t, 320)) or \
+       ("b550" in t and any_price_leq(t, 550)) or \
+       ("x570" in t and any_price_leq(t, 680)) or \
+       ("lga1700" in t and any_price_leq(t, 680)):
+        return True
 
     # Gabinete 4+ fans ≤ 180
-    if "gabinete" in t and contains_any(t, ["4 fan","4fan","4 fans","quatro fans"]) and any_price_leq(t, 180): return True
+    if ("gabinete" in t and any(x in t for x in ["4 fan","4fan","4 fans","quatro fans"]) and any_price_leq(t, 180)):
+        return True
 
     # Fontes
-    if contains_any(t, ["fonte","psu","power supply"]):
-        if contains_any(t, ["650w","750w"]) and contains_any(t, ["80 plus bronze","bronze"]) and any_price_leq(t, 350): return True
-        if contains_any(t, ["750w","850w","1000w","1200w"]) and contains_any(t, ["80 plus gold","gold"]) and any_price_leq(t, 350): return True
+    if any(x in t for x in ["fonte","psu","power supply"]):
+        if any(x in t for x in ["650w","750w"]) and any(x in t for x in ["80 plus bronze","bronze"]) and any_price_leq(t, 350):
+            return True
+        if any(x in t for x in ["750w","850w","1000w","1200w"]) and any(x in t for x in ["80 plus gold","gold"]) and any_price_leq(t, 350):
+            return True
 
     # Teclados Redragon
-    if "redragon" in t and contains_any(t, ["kumara","k552"]): return True
-    if "redragon" in t and contains_any(t, ["elf pro","k649"]) and any_price_leq(t, 160): return True
+    if "redragon" in t and ("kumara" in t or "k552" in t):
+        return True
+    if "redragon" in t and ("elf pro" in t or "k649" in t) and any_price_leq(t, 160):
+        return True
 
     return False
 
@@ -135,7 +148,9 @@ def looks_like_header(line: str) -> bool:
     l = (line or "").strip()
     if not l: return False
     if HEADER_HINT.search(l): return True
-    if len(l) <= 120 and any(w in l.lower() for w in ["console","processador","placa","fonte","gabinete","ssd","memória","memoria","monitor","teclado","mouse","headset","notebook","kit"]):
+    if len(l) <= 120 and any(w in l.lower() for w in [
+        "console","processador","placa","fonte","gabinete","ssd","memória","memoria","monitor","teclado","mouse","headset","notebook","kit"
+    ]):
         return True
     return False
 
@@ -149,7 +164,6 @@ class Accum:
 
 accums: Dict[int, Accum] = defaultdict(Accum)
 names_map: Dict[int, str] = {}   # id -> display
-allow_map: Dict[int, bool] = {}  # id -> allowed
 
 def sanitize_text(t: str) -> str:
     return (t or "").replace("\r\n","\n").replace("\r","\n")
@@ -161,15 +175,11 @@ def resolve_display(ent) -> str:
     if isinstance(ent,(Channel,Chat)) and title: return title
     return str(ent.id)
 
-def chat_allowed_by_display(display: str) -> bool:
-    if ALLOW_ANY: return True
-    key = display.lower().lstrip("@")
-    return key in CHANNEL_USERNAMES
-
 def chat_allowed(chat_id: int, display: str) -> bool:
     if ALLOW_ANY: return True
     if chat_id in MONITORED_IDS: return True
-    return chat_allowed_by_display(display)
+    key = display.lower().lstrip("@")
+    return key in CHANNEL_USERNAMES
 
 def split_items_by_chunks(text: str) -> List[str]:
     text = sanitize_text(text).strip()
@@ -221,10 +231,31 @@ async def schedule_flush(chat_id: int, source: str):
         log.exception(f"Erro no flush: {e}")
 
 # ---------------- MAIN ----------------
+async def kill_other_sessions_if_needed(client: TelegramClient):
+    if not KILL_OTHERS:
+        return
+    try:
+        auths = await client(functions.account.GetAuthorizationsRequest())
+        # Remove todas as sessões que NÃO são a atual
+        to_kill = [a for a in auths.authorizations if not getattr(a, "current", False)]
+        if to_kill:
+            for a in to_kill:
+                try:
+                    await client(functions.account.ResetAuthorizationRequest(hash=a.hash))
+                    log.warning(f"🔒 Sessão remota encerrada: {a.device_model} @ {a.ip}")
+                except Exception as e:
+                    log.error(f"Falha ao encerrar sessão {a.ip}: {e}")
+            log.warning("✅ Outras sessões removidas. Mantida somente a sessão atual.")
+    except Exception as e:
+        log.error(f"Não foi possível listar/remover sessões: {e}")
+
 async def main():
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     try:
         async with client:
+            # Opcional: encerra outras sessões da conta para evitar AuthKeyDuplicated
+            await kill_other_sessions_if_needed(client)
+
             # resolve whitelist p/ log
             resolved = []
             for uname in CHANNEL_USERNAMES:
@@ -232,7 +263,6 @@ async def main():
                     ent = await client.get_entity(uname)
                     disp = resolve_display(ent)
                     names_map[ent.id] = disp
-                    allow_map[ent.id] = True
                     resolved.append(disp)
                 except Exception as e:
                     log.error(f"Falha ao resolver @{uname}: {e}")
@@ -257,20 +287,19 @@ async def main():
 
                     display = names_map.get(chat_id, str(chat_id))
                     if not chat_allowed(chat_id, display):
-                        # silenciosamente ignora fora da whitelist
                         return
 
                     text = sanitize_text(event.message.message or event.raw_text or "")
                     if not text.strip():
                         return
 
-                    # ENVIO IMEDIATO SE A PRÓPRIA MENSAGEM JÁ BATE REGRA
+                    # envio imediato se a mensagem sozinha já bate regra
                     if matches_rules(text):
                         await send_block(text, display)
                         log.info(f"[{display:18}] MATCH → envio imediato")
                         return
 
-                    # senão, acumula e faz flush por debounce (ideal p/ posts com “partes”)
+                    # senão, acumula e flush
                     acc = accums[chat_id]
                     acc.lines.append(text)
                     if acc.task and not acc.task.done():
@@ -286,7 +315,7 @@ async def main():
             await client.run_until_disconnected()
 
     except AuthKeyDuplicatedError:
-        log.error("AuthKeyDuplicatedError: sessão usada em outro IP ao mesmo tempo. Gere nova STRING_SESSION e use só aqui.")
+        log.error("AuthKeyDuplicatedError: sessão usada em outro IP ao mesmo tempo. Gere nova STRING_SESSION e use só aqui — ou ative KILL_OTHER_SESSIONS=true para eu encerrar as demais.")
         sys.exit(1)
 
 if __name__ == "__main__":
