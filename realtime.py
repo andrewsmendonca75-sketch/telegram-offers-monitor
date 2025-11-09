@@ -1,324 +1,356 @@
-# realtime.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
-from typing import Optional, Dict, List
+import sys
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Dict, List, Optional
 
-from telethon import TelegramClient, events
+from telethon import events
 from telethon.sessions import StringSession
-from telethon.tl.types import Message
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
+from telethon import TelegramClient
 
-# ----------------------- Log -----------------------
+import aiohttp
+import json
+from collections import defaultdict
+
+# ---------------------------
+# LOGGING
+# ---------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("realtime")
 
-# --------------------- Helpers ENV -----------------
-def getenv_any(*keys: str, default: Optional[str] = None) -> Optional[str]:
+# ---------------------------
+# ENV HELPERS
+# ---------------------------
+def require_env(*keys: str) -> str:
     for k in keys:
         v = os.getenv(k)
         if v:
             return v
-    return default
+    # se nenhum presente:
+    joined = " ou ".join(keys)
+    raise RuntimeError(
+        f"Variável de ambiente '{joined}' ausente. Defina no .env local ou em Environment Variables do Render."
+    )
 
-def require_any(*keys: str) -> str:
-    v = getenv_any(*keys)
-    if not v:
-        joined = " ou ".join(keys)
-        raise RuntimeError(f"Variável de ambiente ausente: defina {joined}.")
-    return v
+def optional_env(key: str, default: Optional[str] = None) -> Optional[str]:
+    return os.getenv(key, default)
 
-def parse_csv_env(key: str) -> List[str]:
-    raw = os.getenv(key, "")
-    return [s.strip() for s in raw.split(",") if s.strip()]
+# Lê credenciais (com fallback para nomes antigos)
+API_ID = int(require_env("TELEGRAM_API_ID", "API_ID"))
+API_HASH = require_env("TELEGRAM_API_HASH", "API_HASH")
+STRING_SESSION = require_env("TELEGRAM_STRING_SESSION", "STRING_SESSION")
+BOT_TOKEN = require_env("TELEGRAM_TOKEN", "BOT_TOKEN")
 
-# ------------------- Carrega ENV -------------------
-API_ID = int(require_any("TELEGRAM_API_ID", "API_ID"))
-API_HASH = require_any("TELEGRAM_API_HASH", "API_HASH")
-STRING_SESSION = getenv_any("TELEGRAM_STRING_SESSION", "STRING_SESSION", default=None)
+# Canais monitorados
+MONITORED_CHANNELS = optional_env("MONITORED_CHANNELS", "")
+CHANNEL_USERNAMES = [c.strip() for c in MONITORED_CHANNELS.split(",") if c.strip()]
 
-# Destinos
-dest_list = parse_csv_env("USER_DESTINATIONS")
-if not dest_list:
-    one = getenv_any("USER_CHAT_ID", "DEST_CHAT_ID")
-    if one:
-        dest_list = [one]
-if not dest_list:
-    raise RuntimeError("Defina USER_DESTINATIONS (CSV) ou USER_CHAT_ID/DEST_CHAT_ID.")
+# Destinos (um ou vários chat IDs separados por vírgula)
+DESTS_RAW = optional_env("USER_DESTINATIONS", optional_env("USER_CHAT_ID", ""))
+USER_DESTINATIONS = [int(x.strip()) for x in DESTS_RAW.split(",") if x.strip()]
 
-# Canais
-CHANNELS = parse_csv_env("MONITORED_CHANNELS") or [
-    "@pcbuildwizard", "@EconoMister", "@TalkPC", "@pcdorafa", "@PCMakerTopOfertas",
-    "@promocoesdolock", "@HardTecPromocoes", "@canalandrwss", "@iuriindica",
-    "@dantechofertas", "@mpromotech", "@mmpromo", "@promohypepcgamer",
-    "@ofertaskabum", "@terabyteshopoficial", "@pichauofertas",
-    "@sohardwaredorocha", "@soplacadevideo",
-]
+if not CHANNEL_USERNAMES:
+    log.warning("Nenhum canal em MONITORED_CHANNELS — nada será monitorado.")
 
-SESSION_NAME = os.getenv("SESSION_NAME", "realtime_session")
+if not USER_DESTINATIONS:
+    log.warning("Nenhum destino configurado (USER_DESTINATIONS/USER_CHAT_ID).")
 
-# --------------------- Regras ----------------------
-PRICE_LIMITS = {
-    "ram_ddr4_8gb_3200": 180.0,
-    "ssd_nvme_1tb": 460.0,
-    "cpu_max": 900.0,
-    "psu_650w_bronze_max": 350.0,
-    "gabinete_4fans_max": 180.0,
-    "mobo_b550_max": 550.0,
-    "mobo_lga1700_max": 680.0,
-    "mobo_x570_max": 680.0,
-    "redragon_superior_max": 160.0,
-}
+# ---------------------------
+# HTTP/Telegram Bot API
+# ---------------------------
+class BotSender:
+    def __init__(self, token: str):
+        self.base = f"https://api.telegram.org/bot{token}"
 
-WHITELIST_ALWAYS = [
-    "ps5", "playstation 5", "playstation5",
-    "rtx 5060", "5060 ti", "rx 7600",
-    "kumara k552", "k552", "elf pro", "k649", "surara", "k582",
-    "iclamp", "iclamp energia", "iclamp 5t", "clamper",
-    "water cooler 120", "fonte 650w 80 plus bronze", "gabinete", "kit de fans", "ventoinhas",
-]
-BLACKLIST_SNIPPETS = [
-    "saiu vídeo", "review no youtube", "inscreva-se no nosso canal",
-    "link do vídeo", "assista no youtube", "estreia no youtube",
-]
+    async def send(self, chat_id: int, text: str, parse_mode: Optional[str] = None):
+        # Telegram limita 4096 chars por mensagem. Quebramos se necessário.
+        chunks = split_telegram(text, 4096)
+        async with aiohttp.ClientSession() as sess:
+            for chunk in chunks:
+                payload = {"chat_id": chat_id, "text": chunk}
+                if parse_mode:
+                    payload["parse_mode"] = parse_mode
+                async with sess.post(f"{self.base}/sendMessage", json=payload) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        log.error(f"Falha ao enviar para {chat_id}: HTTP {r.status} — {body}")
 
-# preços: captura 1+ valores, ex: R$ 2.970,90 | R$ 2999 | 2.999,00
-RE_PRICE_ALL = re.compile(
-    r"R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2})?)",
-    re.IGNORECASE,
+def split_telegram(text: str, maxlen: int) -> List[str]:
+    if len(text) <= maxlen:
+        return [text]
+    out = []
+    buf = []
+    cur = 0
+    lines = text.splitlines(True)  # mantém quebras
+    for ln in lines:
+        if cur + len(ln) > maxlen:
+            out.append("".join(buf))
+            buf = [ln]
+            cur = len(ln)
+        else:
+            buf.append(ln)
+            cur += len(ln)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+bot_sender = BotSender(BOT_TOKEN)
+
+# ---------------------------
+# PARSE & MATCH RULES
+# ---------------------------
+PRICE_RE = re.compile(
+    r"(?:R\$\s*|(?<!\d))(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2})?)(?!\d)",
+    flags=re.IGNORECASE
 )
 
-AGG_WINDOW_SECONDS = float(os.getenv("AGG_WINDOW_SECONDS", "4.0"))
-
-# -------------------- Cliente TG -------------------
-client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) if STRING_SESSION \
-    else TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-# -------------------- Utils texto ------------------
-def get_text(msg: Message) -> str:
-    return (
-        getattr(msg, "text", None)
-        or getattr(msg, "message", None)
-        or getattr(msg, "raw_text", None)
-        or getattr(msg, "caption", None)
-        or ""
-    ).strip()
-
-def contains_any(text: str, needles) -> bool:
-    t = text.lower()
-    return any(n.lower() in t for n in needles)
-
-def price_to_float(s: str) -> Optional[float]:
+def br_to_float(s: str) -> Optional[float]:
+    # Converte "2.970,90" -> 2970.90 ; "2970,90" -> 2970.90 ; "2970" -> 2970.0
+    s = s.strip()
+    s = s.replace(".", "").replace(",", ".")
     try:
-        s = s.replace(".", "").replace(",", ".")
         return float(s)
     except Exception:
         return None
 
-def extract_prices(text: str) -> List[float]:
+def extract_prices(txt: str) -> List[float]:
     vals = []
-    for m in RE_PRICE_ALL.findall(text):
-        v = price_to_float(m)
-        if v is not None:
-            vals.append(v)
+    for m in PRICE_RE.finditer(txt):
+        val = br_to_float(m.group(1))
+        if val is not None:
+            vals.append(val)
     return vals
 
+def any_price_leq(txt: str, limit: float) -> bool:
+    return any(p <= limit for p in extract_prices(txt))
+
+def contains_any(txt: str, terms: List[str]) -> bool:
+    t = txt.lower()
+    return any(term.lower() in t for term in terms)
+
+# Regras inspiradas no que você vinha usando
+def matches_rules(txt: str) -> bool:
+    t = txt.lower()
+
+    # 1) PS5 (console)
+    if contains_any(t, ["playstation 5", "ps5"]) and contains_any(t, ["slim", "edição digital", "digital"]):
+        return True
+
+    # 2) GPUs alvo
+    if contains_any(t, ["rtx 5060", "5060 ti", "rx 7600"]):
+        return True
+
+    # 3) RAM DDR4 8GB 3200 ≤ 180
+    if contains_any(t, ["ddr4"]) and contains_any(t, ["8gb", "8 gb"]) and contains_any(t, ["3200"]):
+        if any_price_leq(t, 180.0):
+            return True
+
+    # 4) SSD NVMe M.2 1TB ≤ 460
+    if contains_any(t, ["nvme", "m.2"]) and contains_any(t, ["1tb", "1 tb", "1tera", "1 tera"]):
+        if any_price_leq(t, 460.0):
+            return True
+
+    # 5) Placa-mãe (exemplos)
+    if contains_any(t, ["b550"]) and any_price_leq(t, 550.0):
+        return True
+    if contains_any(t, ["x570"]) and any_price_leq(t, 680.0):
+        return True
+    if contains_any(t, ["lga1700"]) and any_price_leq(t, 680.0):
+        return True
+
+    # 6) CPU ≤ 900
+    if contains_any(t, ["ryzen", "intel core", "i3-", "i5-", "i7-", "i9-"]):
+        if any_price_leq(t, 900.0):
+            return True
+
+    # 7) Gabinete com ≥4 fans ≤ 180
+    if contains_any(t, ["gabinete"]) and contains_any(t, ["4 fan", "4fan", "4 fans", "quatro fans"]):
+        if any_price_leq(t, 180.0):
+            return True
+
+    # 8) PSU — exemplos (bronze/gold) com preços absurdamente baixos validam
+    if contains_any(t, ["fonte", "psu", "power supply"]):
+        # Bronze 650/750 ou Gold 750/850/1000/1200 com preço plausível
+        if contains_any(t, ["650w", "750w"]) and contains_any(t, ["80 plus bronze", "bronze"]):
+            if any_price_leq(t, 350.0):
+                return True
+        if contains_any(t, ["750w", "850w", "1000w", "1200w"]) and contains_any(t, ["80 plus gold", "gold"]):
+            if any_price_leq(t, 350.0):
+                return True
+
+    # 9) iClamper (sempre útil)
+    if "iclamper" in t:
+        return True
+
+    # 10) Teclados Redragon
+    if "redragon" in t and contains_any(t, ["kumara", "k552"]) :
+        return True
+    if "redragon" in t and contains_any(t, ["elf pro", "k649"]) and any_price_leq(t, 160.0):
+        return True
+
+    return False
+
+# ---------------------------
+# ACUMULADOR POR CANAL (para juntar mensagens complementares)
+# ---------------------------
+DEBOUNCE_SECONDS = int(os.getenv("ACCUMULATE_SECONDS", "15"))
+
 @dataclass
-class MatchResult:
-    matched: bool
-    reason: str
+class Accum:
+    texts: List[str] = field(default_factory=list)
+    any_match: bool = False
+    task: Optional[asyncio.Task] = None
+    title_hint: Optional[str] = None  # primeira linha do primeiro post
 
-def is_continuation_hint(text: str) -> bool:
-    t = text.lower()
-    return ("r$" in t) or ("cupom" in t) or ("http" in t) or ("link do produto" in t) or ("➡️" in t) or ("✅" in t)
+accums: Dict[int, Accum] = defaultdict(Accum)  # chat_id -> Accum
 
-def rule_match(text: str) -> MatchResult:
-    t = text.lower()
-
-    if contains_any(t, BLACKLIST_SNIPPETS):
-        return MatchResult(False, "Post de vídeo/YouTube — ignorar")
-
-    if contains_any(t, WHITELIST_ALWAYS):
-        return MatchResult(True, "Whitelist forte (produto alvo)")
-
-    prices = extract_prices(text)
-    price = max(prices) if prices else None
-
-    if ("ddr4" in t and "8gb" in t and "3200" in t):
-        if price is not None and price <= PRICE_LIMITS["ram_ddr4_8gb_3200"]:
-            return MatchResult(True, f"RAM DDR4 8GB 3200 ≤ {PRICE_LIMITS['ram_ddr4_8gb_3200']}")
-        return MatchResult(False, "RAM DDR4 3200 fora do teto ou sem preço")
-
-    if ("ssd" in t and "nvme" in t and ("1tb" in t or "1 tb" in t)):
-        if price is not None and price <= PRICE_LIMITS["ssd_nvme_1tb"]:
-            return MatchResult(True, f"SSD NVMe M.2 1TB ≤ {PRICE_LIMITS['ssd_nvme_1tb']}")
-        return MatchResult(False, "SSD NVMe M.2 1TB > teto ou sem preço")
-
-    if any(k in t for k in ["ryzen", "intel core", "i3-", "i5-", "i7-", "i9-"]):
-        if price is not None and price <= PRICE_LIMITS["cpu_max"]:
-            return MatchResult(True, f"CPU ≤ {PRICE_LIMITS['cpu_max']}")
-        return MatchResult(False, "CPU > teto ou sem preço")
-
-    if "ps5" in t or "playstation 5" in t:
-        return MatchResult(True, "PS5 console")
-
-    if "b550" in t:
-        if price is not None and price <= PRICE_LIMITS["mobo_b550_max"]:
-            return MatchResult(True, f"MOBO B550 ≤ {PRICE_LIMITS['mobo_b550_max']}")
-        return MatchResult(False, "MOBO B550 > teto ou ausente")
-
-    if ("lga1700" in t or "b660" in t or "b760" in t):
-        if price is not None and price <= PRICE_LIMITS["mobo_lga1700_max"]:
-            return MatchResult(True, f"MOBO LGA1700 ≤ {PRICE_LIMITS['mobo_lga1700_max']}")
-        return MatchResult(False, "MOBO LGA1700 > teto ou ausente")
-
-    if "x570" in t:
-        if price is not None and price <= PRICE_LIMITS["mobo_x570_max"]:
-            return MatchResult(True, f"MOBO X570 ≤ {PRICE_LIMITS['mobo_x570_max']}")
-        return MatchResult(False, "MOBO X570 > teto ou ausente")
-
-    if "gabinete" in t and ("4 fan" in t or "4 fans" in t):
-        if price is not None and price <= PRICE_LIMITS["gabinete_4fans_max"]:
-            return MatchResult(True, f"Gabinete ok: 4 fans ≤ {PRICE_LIMITS['gabinete_4fans_max']}")
-        return MatchResult(False, "Gabinete bloqueado: <5 fans e preço < 150")
-
-    if ("650w" in t and ("80 plus bronze" in t or "80+ bronze" in t)):
-        if price is not None and price <= PRICE_LIMITS["psu_650w_bronze_max"]:
-            return MatchResult(True, f"PSU ok: 650W 80 Plus Bronze ≤ {PRICE_LIMITS['psu_650w_bronze_max']}")
-        return MatchResult(False, "PSU fora das regras")
-
-    if "water cooler" in t and "120" in t:
-        if price is not None and price < 200:
-            return MatchResult(True, "Water cooler < 200")
-        return MatchResult(False, "Water cooler >= 200 ou sem preço")
-
-    if any(k in t for k in ["elf pro", "k649", "surara", "k582"]):
-        if price is not None and price <= PRICE_LIMITS["redragon_superior_max"]:
-            return MatchResult(True, f"Redragon superior ≤ {PRICE_LIMITS['redragon_superior_max']}")
-        return MatchResult(False, "Redragon superior > teto — bloquear")
-
-    if "kumara" in t or "k552" in t:
-        return MatchResult(True, "Kumara (K552) — alertar sempre")
-
-    if any(k in t for k in ["iclamp", "clamper", "iclamp energia", "iclamp 5t"]):
-        return MatchResult(True, "iClamper")
-
-    return MatchResult(False, "sem match")
-
-def normalized_username(entity) -> str:
-    u = getattr(entity, "username", None)
-    if not u:
-        return "Canal"
-    return "@" + u if not u.startswith("@") else u
-
-def build_out(full_text: str, source_username: str) -> str:
-    return f"{full_text.strip()}\n\nFonte: {source_username}"
-
-# ------------------- Aggregation -------------------
-@dataclass
-class Bucket:
-    texts: List[str]
-    timer: Optional[asyncio.Task]
-    source: str
-
-buckets: Dict[int, Bucket] = {}  # chat_id -> Bucket
-
-async def flush_bucket(chat_id: int):
-    bucket = buckets.get(chat_id)
-    if not bucket:
+async def flush_channel(chat_id: int, channel_name: str):
+    """Envia o pacote acumulado do canal, se ele contém algo 'match'."""
+    acc = accums.get(chat_id)
+    if not acc:
         return
-    text = "\n".join(bucket.texts).strip()
-    if text:
-        for dest in dest_list:
-            await client.send_message(dest, build_out(text, bucket.source))
-        logging.info("· envio=ok → destino(s)")
-    t = bucket.timer
-    if t:
-        try:
-            t.cancel()
-        except Exception:
-            pass
-    buckets.pop(chat_id, None)
+    if not acc.texts:
+        accums.pop(chat_id, None)
+        return
 
-def schedule_flush(chat_id: int):
-    async def _wait_and_flush():
-        await asyncio.sleep(AGG_WINDOW_SECONDS)
-        await flush_bucket(chat_id)
+    full_text = "".join(join_with_spacing(acc.texts))
+    if acc.any_match:
+        header = f"Fonte: @{channel_name}\n\n"
+        payload = header + full_text
+        # Envia para todos os destinos
+        for dest in USER_DESTINATIONS:
+            await bot_sender.send(dest, payload)
+        log.info(f"· envio=ok → destino(s)={','.join(map(str, USER_DESTINATIONS))}")
+    else:
+        log.info(f"[@{channel_name:18}] IGNORADO (sem match após acumulação)")
 
-    # reprograma
-    if chat_id in buckets and buckets[chat_id].timer:
-        try:
-            buckets[chat_id].timer.cancel()
-        except Exception:
-            pass
-    task = client.loop.create_task(_wait_and_flush())
-    if chat_id in buckets:
-        buckets[chat_id].timer = task
+    accums.pop(chat_id, None)
 
-# ------------------- Handler -----------------------
-@client.on(events.NewMessage(chats=CHANNELS))
-async def handler(event: events.NewMessage.Event):
-    try:
-        msg: Message = event.message
-        text = get_text(msg)
-        if not text:
-            logging.info(f"[{event.chat.username if event.chat else 'Canal':<20}] IGNORADO → (sem texto/legenda)")
-            return
+def join_with_spacing(texts: List[str]) -> List[str]:
+    # une mantendo quebras em branco entre blocos diferentes,
+    # e evitando duplicar 'Fonte:' e 'Grupo Telegram:' etc.
+    cleaned: List[str] = []
+    for t in texts:
+        t = t.strip()
+        if not t:
+            continue
+        cleaned.append(t)
+        if not t.endswith("\n"):
+            cleaned.append("\n")
+        cleaned.append("\n")
+    return cleaned
 
-        chat_id = event.chat_id
-        source = normalized_username(await event.get_chat())
+def sanitize_text(t: str) -> str:
+    # Garante newlines limpos; evita caracteres invisíveis comuns
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    return t
 
-        # Se já existe bucket aberto para esse canal → acumula e reprograma flush
-        if chat_id in buckets:
-            buckets[chat_id].texts.append(text)
-            schedule_flush(chat_id)
-            logging.info(f"[{source:<20}] +ACUMULANDO → {text[:40].replace(chr(10),' ')}…")
-            return
-
-        # 1) Tenta regra de match
-        mr = rule_match(text)
-        if mr.matched:
-            logging.info(f"[{source:<20}] MATCH    → {text[:40].replace(chr(10),' ')}… reason={mr.reason}")
-            buckets[chat_id] = Bucket(texts=[text], timer=None, source=source)
-            schedule_flush(chat_id)
-            return
-
-        # 2) Heurística: primeiro pedaço parece continuação (preço/cupom/link) → abre bucket mesmo sem match
-        if is_continuation_hint(text):
-            logging.info(f"[{source:<20}] START CTN → {text[:40].replace(chr(10),' ')}… reason=continuação (preço/cupom/link)")
-            buckets[chat_id] = Bucket(texts=[text], timer=None, source=source)
-            schedule_flush(chat_id)
-            return
-
-        logging.info(f"[{source:<20}] IGNORADO → {text[:40].replace(chr(10),' ')}… reason={mr.reason}")
-
-    except Exception as e:
-        logging.exception(f"Erro no handler: {e}")
-
-# -------------------- Main -------------------------
+# ---------------------------
+# MAIN
+# ---------------------------
 async def main():
-    log.info("Conectando ao Telegram…")
-    await client.start()
-    log.info("Conectado.")
-    resolved = []
-    for ch in CHANNELS:
-        try:
-            ent = await client.get_entity(ch)
-            resolved.append(normalized_username(ent))
-        except Exception:
-            resolved.append(ch)
-    log.info("▶️ Canais resolvidos: " + ", ".join(resolved))
-    log.info(f"✅ Logado — monitorando {len(CHANNELS)} canais…")
-    log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
-    await asyncio.Future()
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-if __name__ == "__main__":
     try:
         with client:
-            client.loop.run_until_complete(main())
+            # Resolver canais
+            resolved = []
+            for uname in CHANNEL_USERNAMES:
+                try:
+                    ent = client.loop.run_until_complete(client.get_entity(uname))
+                    resolved.append(ent)
+                except Exception as e:
+                    log.error(f"Falha ao resolver {uname}: {e}")
+            names_map = {}  # chat_id -> username sem '@'
+            for ent in resolved:
+                uname = getattr(ent, "username", None) or str(ent.id)
+                names_map[ent.id] = uname
+            log.info(
+                "▶️ Canais resolvidos: " + ", ".join([f"@{n}" for n in names_map.values()])
+            )
+            log.info(f"✅ Logado — monitorando {len(resolved)} canais…")
+            log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
+
+            @client.on(events.NewMessage(chats=resolved))
+            async def handler(event):
+                try:
+                    chat_id = event.chat_id
+                    ch_name = names_map.get(chat_id, str(chat_id))
+                    text = sanitize_text(event.message.message or event.raw_text or "")
+                    if not text:
+                        return
+
+                    # Acumula
+                    acc = accums[chat_id]
+                    acc.texts.append(text)
+
+                    # Registrar se algum bloco bateu as regras
+                    matched = matches_rules(text)
+                    acc.any_match = acc.any_match or matched
+
+                    if matched:
+                        log.info(f"[@{ch_name:18}] MATCH    → {text[:40].replace(chr(10),' ')}…")
+                    else:
+                        log.info(f"[@{ch_name:18}] IGNORADO → {text[:40].replace(chr(10),' ')}… reason=sem match")
+
+                    # (re)agenda flush para esse canal
+                    if acc.task and not acc.task.done():
+                        acc.task.cancel()
+                        try:
+                            await acc.task
+                        except:
+                            pass
+                    acc.task = asyncio.create_task(_delay_flush(chat_id, ch_name))
+
+                except Exception as e:
+                    log.exception(f"Erro no handler: {e}")
+
+            await client.run_until_disconnected()
+
+    except AuthKeyDuplicatedError:
+        log.error(
+            "AuthKeyDuplicatedError: sua sessão foi usada em outro IP ao mesmo tempo.\n"
+            "→ Gere uma NOVA TELEGRAM_STRING_SESSION e substitua no Render.\n"
+            "→ Certifique-se de não executar essa mesma sessão localmente."
+        )
+        sys.exit(1)
+
+async def _delay_flush(chat_id: int, ch_name: str):
+    try:
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+        await flush_channel(chat_id, ch_name)
+    except asyncio.CancelledError:
+        # haverá um novo evento e rearmará o timer
+        pass
+    except Exception as e:
+        log.exception(f"Erro no flush: {e}")
+
+# ---------------------------
+# ENTRYPOINT
+# ---------------------------
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Encerrado pelo usuário.")
+        log.info("Encerrado por KeyboardInterrupt.")
+    except Exception as e:
+        if isinstance(e, AuthKeyDuplicatedError):
+            log.error(
+                "AuthKeyDuplicatedError: sua sessão foi usada em outro IP ao mesmo tempo.\n"
+                "→ Gere uma NOVA TELEGRAM_STRING_SESSION e substitua no Render.\n"
+                "→ Certifique-se de não executar essa mesma sessão localmente."
+            )
+        else:
+            log.exception("Falha inesperada.")
+        sys.exit(1)
