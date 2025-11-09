@@ -1,739 +1,288 @@
 # realtime.py
-# -*- coding: utf-8 -*-
+import asyncio
+import logging
 import os
 import re
-import time
-import logging
-from typing import List, Optional, Tuple, Dict
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-import requests
-from telethon import events
-from telethon.sessions import StringSession
-from telethon.sync import TelegramClient
-from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.tl.types import Message
 
-# ---------------------------------------------
-# LOGGING
-# ---------------------------------------------
+# ----------------------- Config & Log -----------------------
+load_dotenv()
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_NAME = os.getenv("SESSION_NAME", "realtime_session")
+DEST_CHAT_ID = os.getenv("DEST_CHAT_ID")  # pode ser número (str) ou @username
+
+# Canais a monitorar (usernames exatos, com @, case-insensitive)
+CHANNELS = [
+    "@pcbuildwizard", "@economister", "@talkpc", "@pcdorafa", "@pcmakertopofertas",
+    "@promocoesdolock", "@hardtecpromocoes", "@canalandrwss", "@iuriindica",
+    "@dantechofertas", "@mpromotech", "@mmpromo", "@promohypepcgamer",
+    "@ofertaskabum", "@terabyteshopoficial", "@pichauofertas",
+    "@sohardwaredorocha", "@soplacadevideo",
+]
+
+# Palavras-chave que forçam encaminhamento integral (whitelist forte)
+WHITELIST_ALWAYS = [
+    # Consoles
+    "ps5", "playstation 5", "playstation5",
+    # GPUs alvo
+    "rtx 5060", "5060 ti", "rx 7600",
+    # Teclados
+    "kumara k552", "k552", "elf pro", "k649", "surara", "k582",
+    # Energia/segurança
+    "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp",
+    "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp",  # redundância ok
+    "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp", "iclamp",
+    "iclamp", "iclamp", "iclamp", "iclamp",  # (o matcher é case-insensitive)
+    "iclamp", "iclamp", "iclamp", "iclamp", "iclamp",
+    "iclamp", "iclamp", "iclamp", "iclamp", "iclamp",
+    "iclamp", "iclamp",
+    "iclamp", "iclamp", "iclamp",
+    "iclamp", "iclamp", "iclamp",
+    "iclamp", "iclamp",
+    "iclamp",
+    "iclamp",  # (mantido por segurança de match)
+    "iclamp", "iclamp",
+    "iclamp",
+    "iclamp",
+    "iclamp",  # ok
+    "iClamper", "clamper", "iclamp", "iclamp energia", "iclamp 5t", "iclamp energia 5t",
+    # Resfriamento e gabinete/PSU
+    "water cooler 120", "fonte 650w 80 plus bronze", "gabinete", "kit de fans", "ventoinhas",
+]
+
+# Stopwords para ignorar (vídeo/YouTube e posts de “conteúdo”, não oferta)
+BLACKLIST_SNIPPETS = [
+    "saiu vídeo", "review no youtube", "inscreva-se no nosso canal",
+    "link do vídeo", "assista no youtube", "estreia no youtube",
+]
+
+# Critérios de preço (mantidos do seu comportamento)
+PRICE_LIMITS = {
+    "ram_ddr4_8gb_3200": 180.0,
+    "ssd_nvme_1tb": 460.0,
+    "cpu_max": 900.0,
+    "psu_650w_bronze_max": 350.0,
+    "gabinete_4fans_max": 180.0,
+    "mobo_b550_max": 550.0,
+    "mobo_lga1700_max": 680.0,
+    "mobo_x570_max": 680.0,
+    "redragon_superior_max": 160.0,  # Elf Pro etc.
+}
+
+# Regex helpers
+RE_PRICE = re.compile(r"R\$\s*([\d\.\,]+)", re.IGNORECASE)
+RE_URL = re.compile(r"https?://\S+", re.IGNORECASE)
+
+# Log
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("realtime")
 
-def _pad_channel(ch: str, width: int = 20) -> str:
-    if not ch:
-        ch = "(desconhecido)"
-    if ch != "(desconhecido)" and not ch.startswith("@"):
-        ch = "@" + ch
-    return f"{ch:<{width}}"
-
-# ---- Utils: nome curto do produto p/ logs ----
-def _product_name(text: str, maxlen: int = 22) -> str:
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if line:
-            line = re.sub(r"\s+", " ", line)
-            return (line[:maxlen] + "…") if len(line) > maxlen else line
-    return "Produto"
-
-def _log_event(channel: str, action: str, product_name: str, price: Optional[float], reason: str):
+# --------------------- Utils & Matchers ---------------------
+def tg_text(msg: Message) -> str:
     """
-    action: 'MATCH' | 'IGNORADO' | 'BLOQUEADO'
-    product_name: primeira linha do item (nome do produto)
+    Pega SEMPRE o texto completo:
+    - texto puro (msg.message / msg.text)
+    - legenda de mídia (msg.caption)
+    Mantém quebras de linha. Não formata markdown (deixa como veio).
     """
-    ch = _pad_channel(channel)
-    p = f"{price:.2f}" if isinstance(price, (int, float)) else "None"
-    if action == "MATCH":
-        logging.info(f"· [{ch}] MATCH    → {product_name:<22} price={p} reason={reason}")
-    elif action == "BLOQUEADO":
-        logging.info(f"· [{ch}] BLOQUEADO → {product_name:<22} price={p} reason={reason}")
-    else:
-        logging.info(f"· [{ch}] IGNORADO → {product_name:<22} price={p} reason={reason}")
+    # Telethon normaliza .text para texto+legenda; se vier vazio, tenta .message
+    text = (getattr(msg, "text", None) or
+            getattr(msg, "message", None) or
+            getattr(msg, "raw_text", None) or
+            getattr(msg, "caption", None) or
+            "")
+    return text.strip()
 
-# ---------------------------------------------
-# ENV
-# ---------------------------------------------
-API_ID = int(os.environ["TELEGRAM_API_ID"])
-API_HASH = os.environ["TELEGRAM_API_HASH"]
-STRING_SESSION = os.environ["TELEGRAM_STRING_SESSION"]
-BOT_TOKEN = os.environ["TELEGRAM_TOKEN"]
+def price_to_float(pt: str) -> Optional[float]:
+    pt = pt.replace(".", "").replace(",", ".")
+    try:
+        return float(pt)
+    except Exception:
+        return None
 
-# Canais a monitorar (usernames separados por vírgula)
-MONITORED_CHANNELS_RAW = os.getenv("MONITORED_CHANNELS", "")
+def extract_first_price(text: str) -> Optional[float]:
+    m = RE_PRICE.search(text)
+    if not m:
+        return None
+    return price_to_float(m.group(1))
 
-# Destinos para envio do alerta (chat_id numérico e/ou @canal onde o bot é admin)
-USER_DESTINATIONS_RAW = os.getenv("USER_DESTINATIONS", os.getenv("USER_CHAT_ID", ""))
+def contains_any(text: str, needles) -> bool:
+    t = text.lower()
+    return any(n.lower() in t for n in needles)
 
-# Retries no envio do bot
-BOT_RETRY = int(os.getenv("BOT_RETRY", "2"))
+@dataclass
+class MatchResult:
+    matched: bool
+    reason: str
 
-# ---------------------------------------------
-# HELPERS — normalização de listas do ENV
-# ---------------------------------------------
-def _split_list(val: str) -> List[str]:
-    if not val:
-        return []
-    return [p.strip() for p in val.split(",") if p.strip()]
+def rule_match(text: str, channel: str) -> MatchResult:
+    t = text.lower()
 
-def _norm_username(u: str) -> Optional[str]:
+    # 1) Ignorar vídeos/YouTube e assuntos não-oferta
+    if contains_any(t, BLACKLIST_SNIPPETS):
+        return MatchResult(False, "Post de vídeo/YouTube — ignorar")
+
+    # 2) Whitelist forte — se falar em alvos principais, repassa sempre
+    if contains_any(t, WHITELIST_ALWAYS):
+        return MatchResult(True, "Whitelist forte (produto alvo)")
+
+    # 3) Regras de produto com teto de preço
+    price = extract_first_price(text)
+
+    # RAM DDR4 8GB 3200
+    if ("ddr4" in t and "8gb" in t and "3200" in t) and price is not None:
+        if price <= PRICE_LIMITS["ram_ddr4_8gb_3200"]:
+            return MatchResult(True, f"RAM DDR4 8GB 3200 ≤ {PRICE_LIMITS['ram_ddr4_8gb_3200']} (R$ {price:.2f})")
+        else:
+            return MatchResult(False, "RAM DDR4 3200 fora do teto ou sem preço")
+
+    # SSD NVMe 1TB
+    if ("ssd" in t and "nvme" in t and ("1tb" in t or "1 tb" in t)) and price is not None:
+        if price <= PRICE_LIMITS["ssd_nvme_1tb"]:
+            return MatchResult(True, f"SSD NVMe M.2 1TB ≤ {PRICE_LIMITS['ssd_nvme_1tb']} (R$ {price:.2f})")
+        else:
+            return MatchResult(False, "SSD NVMe M.2 1TB > teto ou sem preço")
+
+    # CPUs
+    if any(cpu in t for cpu in ["ryzen", "intel core", "i3-", "i5-", "i7-", "i9-"]):
+        if price is not None and price <= PRICE_LIMITS["cpu_max"]:
+            return MatchResult(True, f"CPU ≤ {PRICE_LIMITS['cpu_max']} (R$ {price:.2f})")
+        else:
+            return MatchResult(False, "CPU > teto ou sem preço")
+
+    # PS5
+    if "ps5" in t or "playstation 5" in t:
+        return MatchResult(True, "PS5 console")
+
+    # Placas-mãe
+    if "b550" in t and price is not None:
+        if price <= PRICE_LIMITS["mobo_b550_max"]:
+            return MatchResult(True, f"MOBO B550 ≤ {PRICE_LIMITS['mobo_b550_max']} (R$ {price:.2f})")
+        return MatchResult(False, "MOBO B550, mas preço > teto ou ausente")
+
+    if ("lga1700" in t or "tuf gaming b660" in t or "b760" in t) and price is not None:
+        if price <= PRICE_LIMITS["mobo_lga1700_max"]:
+            return MatchResult(True, f"MOBO LGA1700 ≤ {PRICE_LIMITS['mobo_lga1700_max']} (R$ {price:.2f})")
+        return MatchResult(False, "MOBO LGA1700 > teto ou ausente")
+
+    if "x570" in t and price is not None:
+        if price <= PRICE_LIMITS["mobo_x570_max"]:
+            return MatchResult(True, f"MOBO X570 ≤ {PRICE_LIMITS['mobo_x570_max']} (R$ {price:.2f})")
+        return MatchResult(False, "MOBO X570 > teto ou ausente")
+
+    # Gabinete 4 fans
+    if "gabinete" in t and ("4 fan" in t or "4 fans" in t) and price is not None:
+        if price <= PRICE_LIMITS["gabinete_4fans_max"]:
+            return MatchResult(True, f"Gabinete ok: 4 fans ≤ R$ {PRICE_LIMITS['gabinete_4fans_max']:.0f} (R$ {price:.2f})")
+        return MatchResult(False, "Gabinete bloqueado: <5 fans e preço < 150")
+
+    # Fonte 650W Bronze
+    if ("650w" in t and ("80 plus bronze" in t or "80+ bronze" in t)) and price is not None:
+        if price <= PRICE_LIMITS["psu_650w_bronze_max"]:
+            return MatchResult(True, f"PSU ok: 650W 80 Plus Bronze ≤ R$ {PRICE_LIMITS['psu_650w_bronze_max']:.0f} (R$ {price:.2f})")
+        return MatchResult(False, "PSU fora das regras")
+
+    # Water cooler 120
+    if "water cooler" in t and "120" in t:
+        if price is not None and price < 200:
+            return MatchResult(True, f"Water cooler < 200 (R$ {price:.2f})")
+        return MatchResult(False, "Water cooler >= 200 ou sem preço")
+
+    # Teclados Redragon superiores (Elf Pro etc.)
+    if any(k in t for k in ["elf pro", "k649", "surara", "k582"]):
+        if price is not None and price <= PRICE_LIMITS["redragon_superior_max"]:
+            return MatchResult(True, f"Redragon superior ≤ R$ {PRICE_LIMITS['redragon_superior_max']:.0f}")
+        return MatchResult(False, "Redragon superior > teto — bloquear")
+
+    # Kumara K552 — alertar sempre
+    if "kumara" in t or "k552" in t:
+        return MatchResult(True, "Kumara (K552) — alertar sempre")
+
+    # iClamper
+    if "iclamp" in t or "iclamp" in t or "iClamper".lower() in t or "clamper" in t:
+        return MatchResult(True, "iClamper")
+
+    # Se chegou aqui, não bateu em nada (mas pode ser oferta). Não envia.
+    return MatchResult(False, "sem match")
+
+def build_forward_text(original_text: str, source_username: str) -> str:
+    """
+    Monta o texto que você quer receber:
+    - Mensagem original COMPLETA
+    - Acrescenta 'Fonte: @canal' no fim
+    """
+    clean = original_text.strip()
+    # Evita duplicar "Fonte:" se o canal já coloca; mas mantemos nosso carimbo ao final
+    return f"{clean}\n\nFonte: {source_username}"
+
+def normalized_username(entity) -> str:
+    u = getattr(entity, "username", None)
     if not u:
-        return None
-    u = u.strip()
-    if not u or re.fullmatch(r"\d+", u):
-        return None
-    u = u.lower()
+        return "Canal"
     if not u.startswith("@"):
         u = "@" + u
     return u
 
-MONITORED_USERNAMES: List[str] = []
-for x in _split_list(MONITORED_CHANNELS_RAW):
-    nu = _norm_username(x)
-    if nu:
-        MONITORED_USERNAMES.append(nu)
+# ------------------------- App ------------------------------
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-if not MONITORED_USERNAMES:
-    log.warning("MONITORED_CHANNELS vazio — nada será filtrado (handler ouvirá tudo, mas filtrará por 0 canais).")
-    log.info("▶️ Canais: (nenhum)")
-else:
-    log.info(f"▶️ Canais: {', '.join(MONITORED_USERNAMES)}")
-
-USER_DESTINATIONS: List[str] = _split_list(USER_DESTINATIONS_RAW)
-if not USER_DESTINATIONS:
-    log.warning("USER_DESTINATIONS/USER_CHAT_ID não definido; nada será enviado.")
-else:
-    log.info(f"📬 Destinos: {', '.join(USER_DESTINATIONS)}")
-
-# ---------------------------------------------
-# BOT API
-# ---------------------------------------------
-BOT_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-def bot_send_text(dest: str, text: str) -> Tuple[bool, str]:
-    payload = {
-        "chat_id": dest,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
+@client.on(events.NewMessage(chats=CHANNELS))
+async def handler(event: events.NewMessage.Event):
     try:
-        r = requests.post(f"{BOT_BASE}/sendMessage", json=payload, timeout=20)
-        if r.status_code == 200 and r.json().get("ok"):
-            return True, "ok"
-        return False, r.text
+        msg: Message = event.message
+        channel = await event.get_chat()
+        source = normalized_username(channel)
+
+        text = tg_text(msg)
+
+        # Se não houver texto (ex: só mídia sem legenda), pula
+        if not text:
+            logging.info(f"[{source:<20}] IGNORADO → (sem texto/legenda)")
+            return
+
+        match = rule_match(text, source)
+
+        if match.matched:
+            out = build_forward_text(text, source)
+            await client.send_message(DEST_CHAT_ID, out)
+            logging.info(f"[{source:<20}] MATCH    → {text[:40].replace(chr(10),' ')}… reason={match.reason}")
+            logging.info("· envio=ok → destino=bot")
+        else:
+            logging.info(f"[{source:<20}] IGNORADO → {text[:40].replace(chr(10),' ')}… reason={match.reason}")
+
     except Exception as e:
-        return False, repr(e)
-
-def send_alert_to_all(text: str):
-    for dest in USER_DESTINATIONS:
-        ok, msg = bot_send_text(dest, text)
-        if ok:
-            log.info("· envio=ok → destino=bot")
-        else:
-            log.error(f"· ERRO envio via bot: {msg}")
-            for _ in range(BOT_RETRY):
-                time.sleep(0.6)
-                ok, msg = bot_send_text(dest, text)
-                if ok:
-                    log.info("· envio=ok (retry) → destino=bot")
-                    break
-            if not ok:
-                log.error(f"· Falha ao enviar via bot (depois de retry): {msg}")
-
-# ---------------------------------------------
-# PREÇOS — extrai todos e escolhe por contexto
-# ---------------------------------------------
-TIME_LIKE_RX = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
-_CURRENCY_WS = "\u00A0\u202F\u2009\u200A\\s"
-
-PRICE_REGEX = re.compile(
-    rf"(?:r\${_CURRENCY_WS}*)?"                              # R$ (opcional) + espaços
-    r"("                                                    # captura só o número
-    r"\d{1,3}(?:[.\s\u00A0\u202F\u2009\u200A]\d{3})*(?:,\d{2})?"  # 1.234,56
-    r"|\d+(?:,\d{2})?"                                      # 179 ou 179,90
-    r")",
-    re.IGNORECASE
-)
-
-_UNIT_TOKENS = re.compile(r"^(gb|tb|mhz|hz|w|mm|cm|x|un|und|unid|pins?|pin)$", re.IGNORECASE)
-
-def _to_float(num: str) -> Optional[float]:
-    s = re.sub(r"[.\s\u00A0\u202F\u2009\u200A]", "", num)
-    s = s.replace(",", ".")
-    try:
-        v = float(s)
-        if 0 < v < 100000:
-            return v
-    except:
-        return None
-    return None
-
-def _looks_like_unit_context(text: str, start: int, end: int, full: str) -> bool:
-    """Elimina matches tipo 'PS5', '8GB', '120mm', '3x' e afins."""
-    # 1) letra imediatamente ANTES do dígito (PS5, i5-12400F)
-    if start > 0 and text[start-1].isalpha():
-        return True
-    # 2) token de unidade após (até ~3 chars)
-    tail = text[end:end+6].lower()
-    m = re.match(rf"^[\s\u00A0\u202F\u2009\u200A\-]*([a-z]+)", tail)
-    if m and _UNIT_TOKENS.match(m.group(1)):
-        return True
-    # 3) números muito pequenos sem "R$" (evita 5 de PlayStation 5)
-    if not full.strip().lower().startswith("r$"):
-        num = _to_float(text[start:end])
-        if num is not None and num < 20:
-            return True
-    return False
-
-def parse_all_prices_brl(text: str) -> List[float]:
-    """Retorna TODOS os preços plausíveis do item (prioriza quem tem 'R$')."""
-    if not text:
-        return []
-    text = TIME_LIKE_RX.sub("", text)
-    out = []
-    for m in PRICE_REGEX.finditer(text):
-        full = m.group(0)
-        num  = m.group(1)
-        s, e = m.span(1)
-        if _looks_like_unit_context(text, s, e, full):
-            continue
-        val = _to_float(num)
-        if val is None or val < 5:
-            continue
-        out.append((full.strip().lower().startswith("r$"), val))
-    # ordena: primeiro quem tem "R$", depois valor crescente
-    out.sort(key=lambda t: (not t[0], t[1]))
-    return [v for _, v in out]
-
-def select_price_for_context(text: str, label_hint: str) -> Optional[float]:
-    """Escolhe o preço mais apropriado conforme o tipo do item."""
-    prices = parse_all_prices_brl(text)
-    if not prices:
-        return None
-
-    blob = (text or "").lower()
-    label = (label_hint or "").lower()
-
-    # GPU → 500–8000; preferir o MAIOR plausível (evita 170 vs 1700)
-    if "gpu" in label or GPU_TARGET_RE.search(blob):
-        candidates = [p for p in prices if 500 <= p <= 8000]
-        return max(candidates) if candidates else None
-
-    # CPU → 300–2000; preferir o MENOR (oferta)
-    if "cpu" in label or INTEL_CPU_OK.search(blob) or AMD_CPU_OK.search(blob):
-        candidates = [p for p in prices if 300 <= p <= 2000]
-        return min(candidates) if candidates else None
-
-    # MOBO → 100–2000; menor
-    if "mobo" in label or MB_INTEL_RE.search(blob) or MB_AMD_B550_RE.search(blob) or MB_AMD_X570_RE.search(blob):
-        candidates = [p for p in prices if 100 <= p <= 2000]
-        return min(candidates) if candidates else None
-
-    # RAM / SSD → menor
-    if "ram" in label or (RAM_RE.search(blob) and DDR4_RE.search(blob)):
-        return min(prices)
-    if "ssd" in label or (SSD_RE.search(blob) and (M2_RE.search(blob) or TB1_RE.search(blob))):
-        return min(prices)
-
-    # PS5 / consoles → maior plausível
-    if PS5_CONSOLE_RE.search(blob):
-        candidates = [p for p in prices if 800 <= p <= 10000]
-        return max(candidates) if candidates else max(prices)
-
-    # default → menor
-    return min(prices)
-
-# ---------------------------------------------
-# SPLIT — divide mensagens com vários itens
-# ---------------------------------------------
-SPLIT_BLANKS = re.compile(r"(?:\r?\n\s*\r?\n)+", re.UNICODE)
-
-def split_items(msg: str) -> List[str]:
-    if not msg:
-        return []
-    parts = [p.strip() for p in SPLIT_BLANKS.split(msg) if p.strip()]
-    out = []
-    for p in parts:
-        price_hits = list(PRICE_REGEX.finditer(p))
-        if len(price_hits) >= 2:
-            current = []
-            for line in p.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                current.append(line)
-                if "r$" in line.lower() or PRICE_REGEX.search(line):
-                    out.append("\n".join(current).strip())
-                    current = []
-            if current:
-                out.append("\n".join(current).strip())
-        else:
-            out.append(p)
-    return out
-
-# ---------------------------------------------
-# REGEX — categorias/produtos
-# ---------------------------------------------
-# GPU
-GPU_TARGET_RE = re.compile(r"\b(?:rtx\s*5060|rx\s*7600)\b", re.IGNORECASE)
-GPU_EXCLUDE_RE = re.compile(r"\brtx\s*5050\b", re.IGNORECASE)
-
-# CPU Intel
-INTEL_CPU_OK = re.compile(r"""\b(?:i5[-\s]*12(?:600|700)k?f?|i5[-\s]*13(?:400|500|600)k?f?|i5[-\s]*14(?:400|500|600)k?f?|i7[-\s]*1[234](?:700|900)k?f?|i9[-\s]*\d{4,5}k?f?)\b""", re.IGNORECASE)
-INTEL_12400F = re.compile(r"\bi5[-\s]*12400f\b", re.IGNORECASE)
-INTEL_12600F_KF = re.compile(r"\bi5[-\s]*12600k?f?\b", re.IGNORECASE)
-INTEL_14400F = re.compile(r"\bi5[-\s]*14400k?f?\b", re.IGNORECASE)
-
-# CPU AMD (AM4 high-end)
-AMD_CPU_OK = re.compile(r"""\b(?:ryzen\s*7\s*5700x?|ryzen\s*7\s*5800x3?d?|ryzen\s*9\s*5900x|ryzen\s*9\s*5950x)\b""", re.IGNORECASE)
-
-# MOBOS
-MB_INTEL_RE = re.compile(r"\b(?:h610m?|b660m?|b760m?|z690|z790)\b", re.IGNORECASE)
-MB_AMD_B550_RE = re.compile(r"\bb550m?\b", re.IGNORECASE)
-MB_AMD_X570_RE = re.compile(r"\bx570\b", re.IGNORECASE)
-MB_A520_RE = re.compile(r"\ba520m?\b", re.IGNORECASE)
-
-# Mobos "top" (para CORRE!)
-TOP_MOBO_SERIES_RE = re.compile(
-    r"\b("
-    r"tuf\s+gaming|rog\s+strix|aorus\s+(?:elite|pro|master)|steel\s+legend|"
-    r"tomahawk|mortar|edge|carbon|unify|taichi|phantom\s+gaming|proart"
-    r")\b",
-    re.IGNORECASE
-)
-
-# Gabinete
-GABINETE_RE = re.compile(r"\bgabinete\b", re.IGNORECASE)
-FAN_COUNT_RE = re.compile(
-    r"""(?:
-        (?:(\d+)\s*(?:fans?|coolers?|ventoinhas?)) |
-        (?:(\d+)\s*x\s*120\s*mm) |
-        (?:(\d+)\s*x\s*fan)
-    )""",
-    re.IGNORECASE | re.VERBOSE
-)
-
-# PSU
-PSU_RE = re.compile(r"\b(?:fonte|psu)\b", re.IGNORECASE)
-PSU_CERT_RE = re.compile(r"\b(?:80\s*\+?\s*plus\s*)?(?:bronze|gold)\b", re.IGNORECASE)
-PSU_WATTS_RE = re.compile(r"\b(\d{3,4})\s*w\b", re.IGNORECASE)
-
-# Water cooler
-WATER_COOLER_RE = re.compile(r"\bwater\s*cooler\b", re.IGNORECASE)
-
-# PS5
-PS5_CONSOLE_RE = re.compile(r"\bplaystation\s*5\b|\bps5\b", re.IGNORECASE)
-
-# iClamper
-ICLAMPER_RE = re.compile(r"\biclamper\b|\bclamp(?:er)?\b", re.IGNORECASE)
-
-# Kit de fans
-KIT_FANS_RE = re.compile(r"\b(?:kit\s*(?:de\s*)?(?:fans?|ventoinhas?)|ventoinhas?\s*kit)\b", re.IGNORECASE)
-
-# RAM
-RAM_RE = re.compile(r"\b(?:mem[oó]ria\s*ram|ram)\b", re.IGNORECASE)
-DDR4_RE = re.compile(r"\bddr4\b", re.IGNORECASE)
-GB8_RE = re.compile(r"\b8\s*gb\b", re.IGNORECASE)
-GB16_RE = re.compile(r"\b16\s*gb\b", re.IGNORECASE)
-MHZ_3200_RE = re.compile(r"\b(?:3200\s*mhz|3200mhz|3200)\b", re.IGNORECASE)
-
-# RAM notebook (bloqueio)
-NOTEBOOK_RAM_BLOCK_RE = re.compile(r"\b(?:notebook|laptop|so-?dimm|sodimm|260\s*pin|260p)\b", re.IGNORECASE)
-
-# SSD NVMe M.2 1TB
-SSD_RE = re.compile(r"\bssd\b", re.IGNORECASE)
-M2_RE = re.compile(r"\b(?:m\.?2|m2|nvme|nv3)\b", re.IGNORECASE)
-TB1_RE = re.compile(r"\b1\s*tb\b", re.IGNORECASE)
-
-# Posts não-produto (vídeo / redes)
-NON_PRODUCT_HINTS = [
-    "saiu vídeo", "saiu video", "vídeo novo", "video novo",
-    "assista", "review no youtube", "canal no youtube",
-]
-BLOCK_URL_SUBSTRS = ["youtube.com", "youtu.be", "shorts/", "tiktok.com", "instagram.com/reel"]
-
-def is_non_product_post(text: str) -> bool:
-    blob = (text or "").lower()
-    if any(h in blob for h in NON_PRODUCT_HINTS):
-        return True
-    if any(bad in blob for bad in BLOCK_URL_SUBSTRS):
-        return True
-    return False
-
-# Teclado Redragon — Kumara + superiores
-REDRAGON_RE = re.compile(r"\bredragon\b|\brdgm?\b", re.IGNORECASE)
-KUMARA_RE = re.compile(r"\bkumara\b|\bk-?552\b|\bk-?552rgb\b|\bk-?552rgb-?1\b|\bk-?552rgb-?pro\b|\bkumara\s*pro\b", re.IGNORECASE)
-REDRAGON_SUPERIOR_RE = re.compile(
-    r"(\bdevarajas\b|\bk-?556\b|"
-    r"\bsurara\b|\bk-?582\b|"
-    r"\bdraconic\b|\bk-?530\b|"
-    r"\bcastor\b|\bk-?631\b|\bk-?631\s*pro\b|"
-    r"\bpollux\b|\bk-?628\b|"
-    r"\bel[fv]\b|\bel[fv]\s*pro\b|\bk-?649\b|"
-    r"\bk-?632\b|\bk-?633\b|\bk-?617\b|\bsindri\b)",
-    re.IGNORECASE
-)
-
-# CPUs "superiores" p/ CORRE!
-INTEL_SUPERIOR_RE = re.compile(
-    r"\b(?:(?:i5[-\s]*14(?:400|600)f?)|(?:i5[-\s]*13(?:600)k?f?)|i7[-\s]*1[234]\d{2,3}k?f?|i9[-\s]*1[234]\d{2,3}k?f?)\b",
-    re.IGNORECASE
-)
-AMD_SUPERIOR_RE = AMD_CPU_OK  # cobre 5700X e superiores no AM4 high-end
-
-# ---------------------------------------------
-# Utils
-# ---------------------------------------------
-def count_fans(text: str) -> int:
-    count = 0
-    for m in FAN_COUNT_RE.finditer(text):
-        nums = [n for n in m.groups() if n]
-        for n in nums:
-            try:
-                v = int(n)
-                count = max(count, v)
-            except:
-                pass
-    return count
-
-def product_label(text: str) -> str:
-    t = text.lower()
-
-    if GPU_TARGET_RE.search(t):
-        return "GPU (RTX 5060 / RX 7600)"
-    if INTEL_14400F.search(t) or INTEL_12600F_KF.search(t) or INTEL_12400F.search(t) or INTEL_CPU_OK.search(t):
-        return "CPU Intel"
-    if AMD_CPU_OK.search(t):
-        return "CPU AMD"
-    if MB_AMD_B550_RE.search(t):
-        return "MOBO B550"
-    if MB_AMD_X570_RE.search(t):
-        return "MOBO X570"
-    if MB_INTEL_RE.search(t):
-        return "MOBO LGA1700"
-    if GABINETE_RE.search(t):
-        return "Gabinete"
-    if PSU_RE.search(t):
-        return "Fonte (PSU)"
-    if WATER_COOLER_RE.search(t):
-        return "Water Cooler"
-    if PS5_CONSOLE_RE.search(t):
-        return "Console PS5"
-    if ICLAMPER_RE.search(t):
-        return "Filtro de linha (iClamper)"
-    if KIT_FANS_RE.search(t):
-        return "Kit de Fans"
-    if RAM_RE.search(t) and DDR4_RE.search(t) and MHZ_3200_RE.search(t):
-        if NOTEBOOK_RAM_BLOCK_RE.search(t):
-            return "RAM DDR4 3200 (notebook)"
-        if GB16_RE.search(t):
-            return "RAM DDR4 16GB 3200"
-        if GB8_RE.search(t):
-            return "RAM DDR4 8GB 3200"
-        return "RAM DDR4 3200"
-    if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
-        return "SSD NVMe M.2 1TB"
-    if REDRAGON_RE.search(t):
-        return "Teclado Redragon"
-    return "Produto"
-
-# ---------------------------------------------
-# MATCH LOGIC — retorna ação
-# ---------------------------------------------
-def classify(text: str) -> Tuple[str, str, str, Optional[float]]:
-    """
-    Retorna (action, reason, label, price)
-    action: 'ALERT' | 'BLOQUEADO' | 'IGNORADO'
-    """
-    t = text or ""
-
-    # 0) Corta posts de vídeo/redes
-    if is_non_product_post(t):
-        # rough label pra logging
-        rough_label = product_label(t)
-        price = select_price_for_context(t, rough_label)
-        return "IGNORADO", "Post de vídeo/YouTube — ignorar", "Produto", price
-
-    # rótulo inicial + preço escolhido por contexto
-    rough_label = product_label(t)
-    price = select_price_for_context(t, rough_label)
-
-    # 1) Teclados Redragon — Kumara e superiores (CURTO-CIRCUITO)
-    if REDRAGON_RE.search(t):
-        # Kumara alerta SEMPRE
-        if KUMARA_RE.search(t):
-            return "ALERT", "Kumara (K552) — alertar sempre", "Redragon Kumara", price
-
-        # Superiores (Elf/Elf Pro/K649 etc.)
-        if REDRAGON_SUPERIOR_RE.search(t):
-            if price is not None and price <= 160.0:
-                return "ALERT", "Redragon superior ≤ R$160", "Redragon superior", price
-            return "BLOQUEADO", "Redragon superior > R$160 — bloquear", "Redragon superior", price
-
-        # Outros Redragon ≠ Kumara
-        if price is not None and price > 160.0:
-            return "BLOQUEADO", "Redragon não-Kumara > R$160 — bloquear", "Teclado Redragon", price
-        return "IGNORADO", "Redragon fora dos critérios", "Teclado Redragon", price
-
-    # 2) GPU alvo (RTX 5060 / RX 7600), excluir 5050, preço plausível
-    if GPU_EXCLUDE_RE.search(t):
-        return "IGNORADO", "RTX 5050 explicitamente ignorado", "Produto", price
-    if GPU_TARGET_RE.search(t):
-        if price is None or price < 500 or price > 8000:
-            return "IGNORADO", f"Preço inválido/ausente para GPU alvo (price={price})", "GPU (RTX 5060 / RX 7600)", price
-        return "ALERT", "GPU match (RTX 5060 / RX 7600)", "GPU (RTX 5060 / RX 7600)", price
-
-    # 3) CPU Intel ≤ 900
-    if INTEL_14400F.search(t) or INTEL_12600F_KF.search(t) or INTEL_12400F.search(t) or INTEL_CPU_OK.search(t):
-        if price is not None and price <= 900:
-            return "ALERT", f"CPU <= 900 (R$ {price:.2f})", "CPU Intel", price
-        return "IGNORADO", "CPU Intel, mas preço > 900 ou ausente", "CPU Intel", price
-
-    # 4) CPU AMD ≤ 900
-    if AMD_CPU_OK.search(t):
-        if price is not None and price <= 900:
-            return "ALERT", f"CPU <= 900 (R$ {price:.2f})", "CPU AMD", price
-        return "IGNORADO", "CPU AMD, mas preço > 900 ou ausente", "CPU AMD", price
-
-    # 5) MOBOS
-    if MB_A520_RE.search(t):
-        return "IGNORADO", "A520 bloqueada", "MOBO A520", price
-
-    if MB_AMD_B550_RE.search(t):
-        if price is not None and price <= 550:
-            return "ALERT", f"MOBO B550 ≤ 550 (R$ {price:.2f})", "MOBO B550", price
-        return "IGNORADO", "MOBO B550, mas preço > 550 ou ausente", "MOBO B550", price
-
-    if MB_AMD_X570_RE.search(t):
-        if price is not None and price <= 680:
-            return "ALERT", f"MOBO X570 ≤ 680 (R$ {price:.2f})", "MOBO X570", price
-        return "IGNORADO", "MOBO X570, mas preço > 680 ou ausente", "MOBO X570", price
-
-    if MB_INTEL_RE.search(t):
-        if price is not None and price <= 680:
-            return "ALERT", f"MOBO LGA1700 ≤ 680 (R$ {price:.2f})", "MOBO LGA1700", price
-        return "IGNORADO", "MOBO LGA1700, mas preço > 680 ou ausente", "MOBO LGA1700", price
-
-    # 6) Gabinete
-    if GABINETE_RE.search(t):
-        fans = count_fans(t)
-        if price is None:
-            return "IGNORADO", "Gabinete sem preço", "Gabinete", price
-        if fans >= 4 and price <= 180:
-            return "ALERT", f"Gabinete ok: {fans} fans ≤ R$ 180 (R$ {price:.2f})", "Gabinete", price
-        if fans >= 5 and price <= 230:
-            return "ALERT", f"Gabinete ok: {fans} fans ≤ R$ 230 (R$ {price:.2f})", "Gabinete", price
-        if fans < 5 and price < 150:
-            return "IGNORADO", "Gabinete bloqueado: <5 fans e preço < 150", "Gabinete", price
-        return "IGNORADO", "Gabinete fora das regras", "Gabinete", price
-
-    # 7) PSU — Bronze/Gold, ≥600W, ≤350
-    if PSU_RE.search(t):
-        cert_ok = PSU_CERT_RE.search(t) is not None
-        watts = None
-        m = PSU_WATTS_RE.search(t)
-        if m:
-            try:
-                watts = int(m.group(1))
-            except:
-                watts = None
-        if cert_ok and watts and watts >= 600 and price is not None and price <= 350:
-            cert = PSU_CERT_RE.search(t).group(0)
-            return "ALERT", f"PSU ok: {watts}W {cert} ≤ R$ 350 (R$ {price:.2f})", "Fonte (PSU)", price
-        return "IGNORADO", "PSU fora das regras", "Fonte (PSU)", price
-
-    # 8) Water cooler < 200
-    if WATER_COOLER_RE.search(t):
-        if price is not None and price < 200:
-            return "ALERT", f"Water cooler < 200 (R$ {price:.2f})", "Water Cooler", price
-        return "IGNORADO", "Water cooler >= 200 ou sem preço", "Water Cooler", price
-
-    # 9) PS5
-    if PS5_CONSOLE_RE.search(t):
-        return "ALERT", "PS5 console", "Console PS5", price
-
-    # 10) iClamper
-    if ICLAMPER_RE.search(t):
-        return "ALERT", "iClamper", "Filtro de linha (iClamper)", price
-
-    # 11) Kit de fans 3..9
-    if KIT_FANS_RE.search(t):
-        nums = re.findall(r"\b([3-9])\b", t)
-        if nums:
-            return "ALERT", f"Kit de fans ({'/'.join(nums)} un.)", "Kit de Fans", price
-        fans = count_fans(t)
-        if 3 <= fans <= 9:
-            return "ALERT", f"Kit de fans ({fans} un.)", "Kit de Fans", price
-        return "IGNORADO", "Kit de fans sem quantidade clara (3-9)", "Kit de Fans", price
-
-    # 12) RAM DDR4 3200 — Desktop only
-    if RAM_RE.search(t) and DDR4_RE.search(t) and MHZ_3200_RE.search(t):
-        if NOTEBOOK_RAM_BLOCK_RE.search(t):
-            return "IGNORADO", "RAM notebook/SODIMM — ignorar", "RAM DDR4 3200 (notebook)", price
-        if price is not None:
-            if GB8_RE.search(t) and price <= 180:
-                return "ALERT", f"RAM DDR4 8GB 3200 ≤ 180 (R$ {price:.2f})", "RAM DDR4 8GB 3200", price
-            if GB16_RE.search(t) and price <= 300:
-                return "ALERT", f"RAM DDR4 16GB 3200 ≤ 300 (R$ {price:.2f})", "RAM DDR4 16GB 3200", price
-        return "IGNORADO", "RAM DDR4 3200 fora do teto ou sem preço", "RAM DDR4 3200", price
-
-    # 13) SSD NVMe M.2 1TB ≤ 460
-    if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
-        if price is not None and price <= 460:
-            return "ALERT", f"SSD NVMe M.2 1TB ≤ 460 (R$ {price:.2f})", "SSD NVMe M.2 1TB", price
-        return "IGNORADO", "SSD NVMe M.2 1TB > 460 ou sem preço", "SSD NVMe M.2 1TB", price
-
-    return "IGNORADO", "sem match", "Produto", price
-
-# ---- Regras do cabeçalho CORRE! ----
-def should_rush(title_or_chunk: str, label: str, price: Optional[float]) -> bool:
-    t = title_or_chunk or ""
-    # 1) GPU RTX 5060 <= 1900
-    if GPU_TARGET_RE.search(t) and price is not None and price <= 1900:
-        return True
-    # 2) Intel "superior" <= 899 (i5-14400F/14600/13600, i7/i9 12–14th)
-    if INTEL_SUPERIOR_RE.search(t) and price is not None and price <= 899:
-        return True
-    # 3) AMD "superior" <= 899 (Ryzen 7 5700X+)
-    if AMD_SUPERIOR_RE.search(t) and price is not None and price <= 899:
-        return True
-    # 4) Mobo TOP <= 550 para LGA1700 ou B550/X570
-    if price is not None and price <= 550 and TOP_MOBO_SERIES_RE.search(t):
-        if MB_INTEL_RE.search(t) or MB_AMD_B550_RE.search(t) or MB_AMD_X570_RE.search(t):
-            return True
-    return False
-
-# ---------------------------------------------
-# Mensagem enviada ao bot (cabeçalho + rodapé com canal)
-# ---------------------------------------------
-def format_bot_message(raw_text: str, channel: str, rush: bool = False) -> str:
-    ch = channel or ""
-    if ch and not ch.startswith("@"):
-        ch = "@" + ch
-    header = "Corre!🔥\n\n" if rush else ""
-    footer = f"\n\nFonte: {ch}" if ch else ""
-    return f"{header}{raw_text}{footer}"
-
-# ---------------------------------------------
-# ANTI-DUP / LOCKFILE
-# ---------------------------------------------
-class LRUSeen:
-    def __init__(self, maxlen: int = 400):
-        self.maxlen = maxlen
-        self.set: Dict[int, float] = {}
-
-    def seen(self, msg_id: int) -> bool:
-        if msg_id in self.set:
-            return True
-        if len(self.set) > self.maxlen:
-            items = sorted(self.set.items(), key=lambda kv: kv[1])[: self.maxlen // 2]
-            for k, _ in items:
-                self.set.pop(k, None)
-        self.set[msg_id] = time.time()
-        return False
-
-seen_cache = LRUSeen(400)
-
-LOCK_PATH = "/tmp/realtime_session.lock"
-def acquire_lock() -> Optional[int]:
-    try:
-        import fcntl
-        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fd
-    except Exception:
-        return None
-
-# ---------------------------------------------
-# MAIN
-# ---------------------------------------------
-def main():
-    # Evita 2 processos simultâneos usando a MESMA sessão
-    lock_fd = acquire_lock()
-    if lock_fd is None:
-        log.error("Outra instância já está rodando com esta sessão. Abortando para evitar AuthKeyDuplicatedError.")
-        return
-
-    log.info("Conectando ao Telegram...")
-    try:
-        with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
-            log.info("Conectado.")
-
-            # Warm cache
-            dialogs = client.get_dialogs()
-            username_to_entity = {}
-            for d in dialogs:
-                try:
-                    if d.entity and getattr(d.entity, "username", None):
-                        username_to_entity["@{}".format(d.entity.username.lower())] = d.entity
-                except Exception:
-                    pass
-
-            # Resolve canais (com fallback get_entity, mesmo sem estar inscrito)
-            resolved_entities = []
-            for uname in MONITORED_USERNAMES:
-                ent = username_to_entity.get(uname)
-                if ent is None:
-                    try:
-                        ent = client.get_entity(uname)
-                    except Exception:
-                        ent = None
-                if ent is None:
-                    log.warning(f"Canal não encontrado (ignorado): {uname}")
-                else:
-                    resolved_entities.append(ent)
-
-            if resolved_entities:
-                log.info("▶️ Canais resolvidos: " + ", ".join(
-                    f"@{getattr(e, 'username', '')}" for e in resolved_entities if getattr(e, "username", None)
-                ))
-            else:
-                log.info("▶️ Canais resolvidos: ")
-            log.info(f"✅ Logado — monitorando {len(resolved_entities)} canais…")
-            log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
-
-            @client.on(events.NewMessage(chats=resolved_entities if resolved_entities else None))
-            async def handler(event):
-                try:
-                    if seen_cache.seen(event.id):
-                        return
-
-                    raw_text = (event.raw_text or "").strip()
-                    if not raw_text:
-                        return
-
-                    chan = getattr(event.chat, "username", None)
-                    chan_disp = f"@{chan}" if chan else "(desconhecido)"
-
-                    # Divide a mensagem em itens e processa cada um
-                    for chunk in split_items(raw_text):
-                        action, reason, label, price = classify(chunk)
-
-                        # LOG com nome do produto (primeira linha)
-                        pname = _product_name(chunk)
-                        _log_event(
-                            chan_disp,
-                            "MATCH" if action == "ALERT" else ("BLOQUEADO" if action == "BLOQUEADO" else "IGNORADO"),
-                            pname, price, reason
-                        )
-
-                        # Envia somente nos itens que deram ALERT
-                        if action == "ALERT":
-                            txt = chunk.strip()
-                            if len(txt) < 8:
-                                continue  # evita enviar cabeçalho sem conteúdo
-                            rush = should_rush(chunk, label, price)
-                            msg = format_bot_message(txt, chan or "", rush=rush)
-                            send_alert_to_all(msg)
-
-                except Exception as e:
-                    log.exception(f"Handler error: {e}")
-
-            client.run_until_disconnected()
-
-    except AuthKeyDuplicatedError:
-        log.error("AuthKeyDuplicatedError: a mesma StringSession está ativa em outro host/instância. Encerre a outra ou gere nova STRING_SESSION.")
-        return
+        logging.exception(f"Erro no handler: {e}")
+
+async def main():
+    # Conexão e verificação de canais
+    log.info("Conectando ao Telegram…")
+    await client.start()
+    log.info("Conectado.")
+    # Resolve/normaliza canais e confirma monitoramento
+    resolved = []
+    for ch in CHANNELS:
+        try:
+            ent = await client.get_entity(ch)
+            resolved.append(normalized_username(ent))
+        except Exception:
+            resolved.append(ch)
+    log.info("▶️ Canais resolvidos: " + ", ".join(resolved))
+    log.info(f"✅ Logado — monitorando {len(CHANNELS)} canais…")
+    log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
+    await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
-    main()
+    try:
+        with client:
+            client.loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        log.info("Encerrado pelo usuário.")
