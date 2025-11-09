@@ -141,29 +141,24 @@ def send_alert_to_all(text: str):
                 log.error(f"· Falha ao enviar via bot (depois de retry): {msg}")
 
 # ---------------------------------------------
-# PREÇOS — parser BR (à prova de PS5/8GB)
+# PREÇOS — extrai todos e escolhe por contexto
 # ---------------------------------------------
 TIME_LIKE_RX = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
-
 _CURRENCY_WS = "\u00A0\u202F\u2009\u200A\\s"
 
 PRICE_REGEX = re.compile(
     rf"(?:r\${_CURRENCY_WS}*)?"                              # R$ (opcional) + espaços
-    r"("                                                    # captura apenas o número
-    r"\d{1,3}(?:[.\s\u00A0\u202F\u2009\u200A]\d{3})*(?:,\d{2})?"  # 1.234,56 com espaços/nbsp
+    r"("                                                    # captura só o número
+    r"\d{1,3}(?:[.\s\u00A0\u202F\u2009\u200A]\d{3})*(?:,\d{2})?"  # 1.234,56
     r"|\d+(?:,\d{2})?"                                      # 179 ou 179,90
     r")",
     re.IGNORECASE
 )
 
-_UNIT_TOKENS = re.compile(
-    r"^(gb|tb|mhz|hz|w|mm|cm|x|un|und|unid|pins?|pin)$",
-    re.IGNORECASE
-)
+_UNIT_TOKENS = re.compile(r"^(gb|tb|mhz|hz|w|mm|cm|x|un|und|unid|pins?|pin)$", re.IGNORECASE)
 
 def _to_float(num: str) -> Optional[float]:
-    s = num
-    s = re.sub(r"[.\s\u00A0\u202F\u2009\u200A]", "", s)  # remove milhar e espaços
+    s = re.sub(r"[.\s\u00A0\u202F\u2009\u200A]", "", num)
     s = s.replace(",", ".")
     try:
         v = float(s)
@@ -173,52 +168,80 @@ def _to_float(num: str) -> Optional[float]:
         return None
     return None
 
-def _looks_like_unit_context(text: str, start: int, end: int) -> bool:
-    """
-    Exclui matches que são, na prática, parte de "PS5", "8GB", "120mm", "600W", "3x", etc.
-    - Se houver letra imediatamente ANTES do dígito -> descarta (ex.: 'PS5')
-    - Se houver unidade até ~3 chars depois -> descarta (ex.: '8GB', '120mm', '600 W')
-    """
+def _looks_like_unit_context(text: str, start: int, end: int, full: str) -> bool:
+    """Elimina matches tipo 'PS5', '8GB', '120mm', '3x' e afins."""
+    # 1) letra imediatamente ANTES do dígito (PS5, i5-12400F)
     if start > 0 and text[start-1].isalpha():
         return True
+    # 2) token de unidade após (até ~3 chars)
     tail = text[end:end+6].lower()
     m = re.match(rf"^[\s\u00A0\u202F\u2009\u200A\-]*([a-z]+)", tail)
-    if m:
-        tok = m.group(1)
-        if _UNIT_TOKENS.match(tok):
+    if m and _UNIT_TOKENS.match(m.group(1)):
+        return True
+    # 3) números muito pequenos sem "R$" (evita 5 de PlayStation 5)
+    if not full.strip().lower().startswith("r$"):
+        num = _to_float(text[start:end])
+        if num is not None and num < 20:
             return True
     return False
 
-def parse_lowest_price_brl(text: str) -> Optional[float]:
+def parse_all_prices_brl(text: str) -> List[float]:
+    """Retorna TODOS os preços plausíveis do item (prioriza quem tem 'R$')."""
     if not text:
-        return None
+        return []
     text = TIME_LIKE_RX.sub("", text)
-    matches = list(PRICE_REGEX.finditer(text))
-    if not matches:
-        return None
-
-    scored = []
-    for m in matches:
+    out = []
+    for m in PRICE_REGEX.finditer(text):
         full = m.group(0)
         num  = m.group(1)
-        start, end = m.span(1)
-        if _looks_like_unit_context(text, start, end):
+        s, e = m.span(1)
+        if _looks_like_unit_context(text, s, e, full):
             continue
-
         val = _to_float(num)
         if val is None or val < 5:
             continue
+        out.append((full.strip().lower().startswith("r$"), val))
+    # ordena: primeiro quem tem "R$", depois valor crescente
+    out.sort(key=lambda t: (not t[0], t[1]))
+    return [v for _, v in out]
 
-        score = 1
-        if full.strip().lower().startswith("r$"):
-            score += 2
-        scored.append((score, val))
-
-    if not scored:
+def select_price_for_context(text: str, label_hint: str) -> Optional[float]:
+    """Escolhe o preço mais apropriado conforme o tipo do item."""
+    prices = parse_all_prices_brl(text)
+    if not prices:
         return None
 
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return scored[0][1]
+    blob = (text or "").lower()
+    label = (label_hint or "").lower()
+
+    # GPU → 500–8000; preferir o MAIOR plausível (evita 170 vs 1700)
+    if "gpu" in label or GPU_TARGET_RE.search(blob):
+        candidates = [p for p in prices if 500 <= p <= 8000]
+        return max(candidates) if candidates else None
+
+    # CPU → 300–2000; preferir o MENOR (oferta)
+    if "cpu" in label or INTEL_CPU_OK.search(blob) or AMD_CPU_OK.search(blob):
+        candidates = [p for p in prices if 300 <= p <= 2000]
+        return min(candidates) if candidates else None
+
+    # MOBO → 100–2000; menor
+    if "mobo" in label or MB_INTEL_RE.search(blob) or MB_AMD_B550_RE.search(blob) or MB_AMD_X570_RE.search(blob):
+        candidates = [p for p in prices if 100 <= p <= 2000]
+        return min(candidates) if candidates else None
+
+    # RAM / SSD → menor
+    if "ram" in label or (RAM_RE.search(blob) and DDR4_RE.search(blob)):
+        return min(prices)
+    if "ssd" in label or (SSD_RE.search(blob) and (M2_RE.search(blob) or TB1_RE.search(blob))):
+        return min(prices)
+
+    # PS5 / consoles → maior plausível
+    if PS5_CONSOLE_RE.search(blob):
+        candidates = [p for p in prices if 800 <= p <= 10000]
+        return max(candidates) if candidates else max(prices)
+
+    # default → menor
+    return min(prices)
 
 # ---------------------------------------------
 # SPLIT — divide mensagens com vários itens
@@ -423,11 +446,17 @@ def classify(text: str) -> Tuple[str, str, str, Optional[float]]:
     action: 'ALERT' | 'BLOQUEADO' | 'IGNORADO'
     """
     t = text or ""
-    price = parse_lowest_price_brl(t)
 
     # 0) Corta posts de vídeo/redes
     if is_non_product_post(t):
+        # rough label pra logging
+        rough_label = product_label(t)
+        price = select_price_for_context(t, rough_label)
         return "IGNORADO", "Post de vídeo/YouTube — ignorar", "Produto", price
+
+    # rótulo inicial + preço escolhido por contexto
+    rough_label = product_label(t)
+    price = select_price_for_context(t, rough_label)
 
     # 1) Teclados Redragon — Kumara e superiores (CURTO-CIRCUITO)
     if REDRAGON_RE.search(t):
@@ -690,8 +719,11 @@ def main():
 
                         # Envia somente nos itens que deram ALERT
                         if action == "ALERT":
+                            txt = chunk.strip()
+                            if len(txt) < 8:
+                                continue  # evita enviar cabeçalho sem conteúdo
                             rush = should_rush(chunk, label, price)
-                            msg = format_bot_message(chunk, chan or "", rush=rush)
+                            msg = format_bot_message(txt, chan or "", rush=rush)
                             send_alert_to_all(msg)
 
                 except Exception as e:
