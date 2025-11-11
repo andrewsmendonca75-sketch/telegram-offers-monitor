@@ -1,4 +1,3 @@
-# realtime.py
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -18,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("realtime")
+log = logging.getLogger("monitor")
 
 # ---------------------------------------------
 # ENV
@@ -31,32 +30,24 @@ BOT_TOKEN = os.environ["TELEGRAM_TOKEN"]
 MONITORED_CHANNELS_RAW = os.getenv("MONITORED_CHANNELS", "")
 USER_DESTINATIONS_RAW = os.getenv("USER_DESTINATIONS", os.getenv("USER_CHAT_ID", ""))
 
-BOT_RETRY = int(os.getenv("BOT_RETRY", "2"))
-
-def _split_list(val: str) -> List[str]:
-    return [p.strip() for p in val.split(",") if p.strip()] if val else []
+def _split_csv(val: str) -> List[str]:
+    return [p.strip() for p in val.split(",") if p and p.strip()]
 
 def _norm_username(u: str) -> Optional[str]:
-    if not u:
-        return None
+    if not u: return None
     u = u.strip()
-    # se numérico, não é username
+    if not u: return None
     if re.fullmatch(r"\d+", u):
-        return None
+        return None  # é id numérico, não username
     u = u.lower()
     if not u.startswith("@"):
-        u = "@" + u
+        u = "@"+u
     return u
 
 MONITORED_USERNAMES: List[str] = []
-for x in _split_list(MONITORED_CHANNELS_RAW):
+for x in _split_csv(MONITORED_CHANNELS_RAW):
     nu = _norm_username(x)
-    if nu:
-        MONITORED_USERNAMES.append(nu)
-
-# garantir inclusão de @economister se não estiver
-if "@economister" not in MONITORED_USERNAMES:
-    MONITORED_USERNAMES.append("@economister")
+    if nu: MONITORED_USERNAMES.append(nu)
 
 if not MONITORED_USERNAMES:
     log.warning("MONITORED_CHANNELS vazio — nada será filtrado (handler ouvirá tudo, mas filtrará por 0 canais).")
@@ -64,23 +55,16 @@ if not MONITORED_USERNAMES:
 else:
     log.info("▶️ Canais: " + ", ".join(MONITORED_USERNAMES))
 
-USER_DESTINATIONS: List[str] = _split_list(USER_DESTINATIONS_RAW)
+USER_DESTINATIONS: List[str] = _split_csv(USER_DESTINATIONS_RAW)
 if not USER_DESTINATIONS:
     log.warning("USER_DESTINATIONS/USER_CHAT_ID não definido; nada será enviado.")
 else:
-    log.info(f"📬 Destinos: {', '.join(USER_DESTINATIONS)}")
+    log.info("📬 Destinos: " + ", ".join(USER_DESTINATIONS))
 
-# ---------------------------------------------
-# BOT API (sem parse_mode)
-# ---------------------------------------------
 BOT_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 def bot_send_text(dest: str, text: str) -> Tuple[bool, str]:
-    payload = {
-        "chat_id": dest,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": dest, "text": text, "disable_web_page_preview": True}
     try:
         r = requests.post(f"{BOT_BASE}/sendMessage", json=payload, timeout=20)
         if r.status_code == 200 and r.json().get("ok"):
@@ -89,315 +73,294 @@ def bot_send_text(dest: str, text: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, repr(e)
 
-def send_alert_to_all(text: str):
-    for dest in USER_DESTINATIONS:
-        ok, msg = bot_send_text(dest, text)
+def notify_all(text: str):
+    for d in USER_DESTINATIONS:
+        ok, msg = bot_send_text(d, text)
         if ok:
-            log.info("· envio=ok → destinos=%s", dest)
+            log.info("· envio=ok → destinos=%s", d)
         else:
-            log.error("· ERRO envio via bot: %s", msg)
-            for _ in range(BOT_RETRY):
-                time.sleep(0.5)
-                ok2, _ = bot_send_text(dest, text)
-                if ok2:
-                    log.info("· envio=ok (retry) → destinos=%s", dest)
-                    break
+            log.error("· envio=ERRO → %s", msg)
 
 # ---------------------------------------------
-# PRICE PARSER (BR)
+# PRICE PARSER (BR robusto)
 # ---------------------------------------------
-PRICE_REGEX = re.compile(
-    r"""(?i)
-    (?:R\$\s*)?(
-        \d{1,3}(?:\.\d{3})+(?:,\d{2})?   # 1.234,56 / 12.345
-        |\d+(?:,\d{2})?                  # 199,90 / 199
-        |\d+\.\d{2}                      # 199.90
+PRICE_RE = re.compile(
+    r"""
+    (?:
+        (?:r\$\s*)?
+        (?:
+            \d{1,3}(?:\.\d{3})+(?:,\d{2})?  # 1.234,56
+          | \d+(?:,\d{2})?                  # 123 ou 123,45
+          | \d+\.\d{2}                      # 123.45
+        )
     )
     """,
-    re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-def _normalize_number(s: str) -> Optional[float]:
+def _to_float_brl(s: str) -> Optional[float]:
     s = s.strip()
     s = re.sub(r"\s+", "", s)
     if "," in s:
         s = s.replace(".", "").replace(",", ".")
     else:
-        # 1.700 → 1700 (milhar)
-        parts = s.split(".")
-        if len(parts) > 1 and all(p.isdigit() for p in parts):
-            # se último bloco tem 3 dígitos e há pelo menos um à esquerda, junta
-            if len(parts[-1]) == 3:
-                s = "".join(parts)
+        # Heurística: "3.199" => 3199
+        m = re.fullmatch(r"(\d+)\.(\d{3})", s)
+        if m:
+            s = m.group(1) + m.group(2)
     try:
         v = float(s)
-        if 0 < v < 100000:
-            return v
+        return v if 0 < v < 100000 else None
     except:
         return None
-    return None
 
-def extract_prices(text: str) -> List[float]:
-    vals: List[float] = []
-    for m in PRICE_REGEX.finditer(text):
-        raw = m.group(1)
-        v = _normalize_number(raw)
+def find_lowest_price(text: str) -> Optional[float]:
+    vals = []
+    for m in PRICE_RE.finditer(text):
+        raw = re.sub(r"(?i)^r\$\s*", "", m.group(0))
+        v = _to_float_brl(raw)
         if v is not None:
             vals.append(v)
-    # descartar valores muito baixos (provável %/erro)
-    vals = [v for v in vals if v >= 5]
-    return vals
-
-def lowest_price(text: str) -> Optional[float]:
-    vals = extract_prices(text)
-    return min(vals) if vals else None
+    if not vals: return None
+    # remove valores muito baixos (erros de OCR: 3.199 => 3.20)
+    cleaned = [x for x in vals if x >= 5.0]
+    if not cleaned: cleaned = vals
+    return min(cleaned)
 
 # ---------------------------------------------
-# REGEX DE PRODUTOS / CATEGORIAS
+# REGEX / REGRAS
 # ---------------------------------------------
 # GPUs
 RTX5060_RE = re.compile(r"\brtx\s*5060\b", re.IGNORECASE)
-RX7600_RE = re.compile(r"\brx\s*7600\b", re.IGNORECASE)
+RTX5070_RE = re.compile(r"\brtx\s*5070\b", re.IGNORECASE)
+RX7600_RE  = re.compile(r"\brx\s*7600\b", re.IGNORECASE)
 
 # CPUs Intel
 INTEL_ANY_SUP = re.compile(
     r"""\b(?:
-        i5[-\s]*1[2-4]\d{3}k?f? |
-        i7[-\s]*1[2-4]\d{3}k?f? |
+        i5[-\s]*12(?:600|700)k?f? |
+        i5[-\s]*13(?:400|500|600)k?f? |
+        i5[-\s]*14(?:400|500|600)k?f? |
+        i7[-\s]*12(?:700|900)k?f? |
+        i7[-\s]*13(?:700|900)k?f? |
+        i7[-\s]*14(?:700|900)k?f? |
         i9[-\s]*\d{4,5}k?f?
     )\b""",
-    re.IGNORECASE | re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE
 )
 INTEL_14400F = re.compile(r"\bi5[-\s]*14400k?f?\b", re.IGNORECASE)
 INTEL_12600F_KF = re.compile(r"\bi5[-\s]*12600k?f?\b", re.IGNORECASE)
+INTEL_12400F = re.compile(r"\bi5[-\s]*12400f\b", re.IGNORECASE)
 
-# CPUs AMD
-RYZEN_5700X_PLUS = re.compile(
+# CPUs AMD (AM4 sup.)
+AMD_SUP = re.compile(
     r"""\b(?:
-        ryzen\s*7\s*5700x |
+        ryzen\s*7\s*5700x? |
         ryzen\s*7\s*5800x3?d? |
         ryzen\s*9\s*5900x |
         ryzen\s*9\s*5950x
     )\b""",
-    re.IGNORECASE | re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE
 )
-RYZEN_5700_NONX = re.compile(r"\bryzen\s*7\s*5700\b", re.IGNORECASE)
 
 # MOBOS
+A520_RE = re.compile(r"\ba520m?\b", re.IGNORECASE)
 B550_RE = re.compile(r"\bb550m?\b", re.IGNORECASE)
-X570_RE = re.compile(r"\bx570\b", re.IGNORECASE)
-INTEL_LGA1700_MB = re.compile(r"\b(h610m?|b660m?|b760m?|z690|z790)\b", re.IGNORECASE)
-TOP_MB_BRANDS = re.compile(r"\b(tuf|elite|aorus|strix|tomahawk|steel\s*legend)\b", re.IGNORECASE)
-A520_RE = re.compile(r"\ba520m?\b", re.IGNORECASE)  # bloqueio
+AM4_TOP = re.compile(r"\b(?:tuf|elite|aorus|tomahawk|steel\s*legend|strix|prime)\b", re.IGNORECASE)
+LGA1700 = re.compile(r"\b(?:h610|b660|b760|z690|z790)\b", re.IGNORECASE)
 
-# RAM DDR4
-DDR4_RE = re.compile(r"\bddr\s*4\b|\bddr4\b", re.IGNORECASE)
-RAM_16GB_RE = re.compile(r"\b(16\s*gb|2x8\s*gb|1x16\s*gb)\b", re.IGNORECASE)
-RAM_8GB_RE = re.compile(r"\b(8\s*gb|1x8\s*gb)\b", re.IGNORECASE)
-
-# SSD 1TB NVMe/M.2
-SSD_RE = re.compile(r"\bssd\b", re.IGNORECASE)
-ONE_TB_RE = re.compile(r"\b1\s*tb\b|\b1tb\b", re.IGNORECASE)
-NVME_M2_RE = re.compile(r"\b(nvme|nv2|nv3|m\.?2|m2|pcie)\b", re.IGNORECASE)
-
-# Gabinete e fans
-GABINETE_RE = re.compile(r"\bgabinete\b", re.IGNORECASE)
-FAN_COUNT_RE = re.compile(
+# GABINETE
+GAB_RE = re.compile(r"\bgabinete\b", re.IGNORECASE)
+FANS_HINT = re.compile(
     r"""(?:
         (?:(\d+)\s*(?:fans?|coolers?|ventoinhas?))|
         (?:(\d+)\s*x\s*120\s*mm)|
         (?:(\d+)\s*x\s*fan)
     )""",
-    re.IGNORECASE | re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE
 )
 
-# Water cooler
-WATER_COOLER_RE = re.compile(r"\bwater\s*cooler\b|\bwatercooler\b|\bwc\s*(?:120|240)\b", re.IGNORECASE)
+# WATER COOLER
+WATER_RE = re.compile(r"\bwater\s*cooler\b", re.IGNORECASE)
 
-# Teclado Redragon (superior ao Kumara)
-REDRAGON_RE = re.compile(r"\bredragon\b", re.IGNORECASE)
-KUMARA_RE = re.compile(r"\bkumara\b", re.IGNORECASE)
+# SSD NVMe M.2 1TB
+SSD_RE = re.compile(r"\bssd\b", re.IGNORECASE)
+M2_RE  = re.compile(r"\bm\.?2\b|\bm2\b|\bnvme\b", re.IGNORECASE)
+TB1_RE = re.compile(r"\b1\s*tb\b|\b1tb\b", re.IGNORECASE)
 
-# PS5
+# RAM DDR4
+RAM_RE   = re.compile(r"\bmem[oó]ria|\bram\b", re.IGNORECASE)
+DDR4_RE  = re.compile(r"\bddr\s*4\b|\bddr4\b", re.IGNORECASE)
+GB16_RE  = re.compile(r"\b16\s*gb\b|\b16gb\b", re.IGNORECASE)
+GB8_RE   = re.compile(r"\b8\s*gb\b|\b8gb\b", re.IGNORECASE)
+
+# PS5 (para quando quiser alertar)
 PS5_RE = re.compile(r"\bps5\b|\bplaystation\s*5\b", re.IGNORECASE)
 
 # ---------------------------------------------
-# UTILS
+# UTIL
 # ---------------------------------------------
 def count_fans(text: str) -> int:
-    max_f = 0
-    for m in FAN_COUNT_RE.finditer(text):
+    n = 0
+    for m in FANS_HINT.finditer(text):
         for g in m.groups():
             if g and g.isdigit():
-                max_f = max(max_f, int(g))
-    return max_f
+                n = max(n, int(g))
+    return n
 
-def footer_with_channel(text: str, channel_username: Optional[str]) -> str:
-    ch = f"@{channel_username}" if channel_username else ""
-    if ch:
-        return f"{text}\n\n— via {ch}"
-    return text
-
-# ---------------------------------------------
-# CLASSIFICADOR + REGRAS
-# ---------------------------------------------
-def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str, bool]:
+def add_header_if_needed(product_key: str, price: Optional[float]) -> bool:
     """
-    Retorna:
-      (is_match, categoria, titulo_curto, preco, motivo, usar_cabecalho_corre)
+    Decide se adiciona 'Corre!🔥' no topo, conforme as regras especiais.
     """
-    t = text
-    price = lowest_price(t)
-
-    # GPUs
-    if RTX5060_RE.search(t) or RX7600_RE.search(t):
-        categoria = "GPU"
-        titulo = "RTX 5060" if RTX5060_RE.search(t) else "RX 7600"
-        if price is None:
-            return False, categoria, titulo, None, "GPU sem preço", False
-        if RTX5060_RE.search(t):
-            # MATCH e cabeçalho < 1900
-            if price < 1900:
-                return True, categoria, titulo, price, "RTX 5060 < 1900", True
-            else:
-                return True, categoria, titulo, price, "GPU (sem cabeçalho)", False
-        else:
-            # RX 7600: regra geral de GPU (sem cabeçalho)
-            return True, categoria, titulo, price, "GPU", False
-
-    # CPUs Intel (supers) incl. 12600F/KF
-    if INTEL_ANY_SUP.search(t):
-        categoria = "CPU Intel"
-        titulo = INTEL_14400F.search(t) and "i5-14400F/KF" or (INTEL_12600F_KF.search(t) and "i5-12600F/KF" or "Intel série 12/13/14")
-        if price is None:
-            return False, categoria, titulo, None, "CPU Intel sem preço", False
-        if price <= 899:
-            # cabeçalho
-            return True, categoria, titulo, price, "Intel ≤ 899", True
-        else:
-            return False, categoria, titulo, price, "CPU Intel > 899", False
-
-    # CPUs AMD
-    if RYZEN_5700X_PLUS.search(t) or RYZEN_5700_NONX.search(t):
-        categoria = "CPU AMD"
-        titulo = "Ryzen 7 5700X/+" if RYZEN_5700X_PLUS.search(t) else "Ryzen 7 5700"
-        if price is None:
-            return False, categoria, titulo, None, "CPU AMD sem preço", False
-        if price <= 899:
-            # cabeçalho só se 5700X ou superior
-            use_hdr = bool(RYZEN_5700X_PLUS.search(t))
-            motivo = "Ryzen ≤ 899" + (" (5700X+)" if use_hdr else "")
-            return True, categoria, titulo, price, motivo, use_hdr
-        else:
-            return False, categoria, titulo, price, "CPU AMD > 899", False
-
-    # MOBOS — bloquear A520 sempre
-    if A520_RE.search(t):
-        return False, "MOBO", "A520", price, "A520 bloqueada", False
-
-    # B550 < 550 (estrito)
-    if B550_RE.search(t):
-        categoria = "MOBO AM4"
-        titulo = "B550"
-        if price is None:
-            return False, categoria, titulo, None, "MOBO sem preço", False
-        if price < 550:
-            return True, categoria, titulo, price, "B550 < 550", False
-        else:
-            return False, categoria, titulo, price, "B550 ≥ 550", False
-
-    # MOBOS TOP < 550 (Intel LGA1700 + AM4/X570) — cabeçalho
-    if TOP_MB_BRANDS.search(t) and (INTEL_LGA1700_MB.search(t) or B550_RE.search(t) or X570_RE.search(t)):
-        categoria = "MOBO TOP"
-        titulo = "Mobo TOP (TUF/Elite/Aorus/Strix/…)"
-        if price is None:
-            return False, categoria, titulo, None, "MOBO top sem preço", False
-        if price < 550:
-            return True, categoria, titulo, price, "Mobo TOP < 550", True
-        else:
-            return False, categoria, titulo, price, "Mobo TOP ≥ 550", False
-
-    # RAM DDR4 — 16GB ≤ 300, 8GB ≤ 150
-    if DDR4_RE.search(t):
-        categoria = "RAM DDR4"
-        if RAM_16GB_RE.search(t):
-            titulo = "DDR4 16GB"
-            if price is not None and price <= 300:
-                return True, categoria, titulo, price, "DDR4 16GB ≤ 300", False
-            return False, categoria, titulo, price, "DDR4 16GB > 300 ou sem preço", False
-        if RAM_8GB_RE.search(t):
-            titulo = "DDR4 8GB"
-            if price is not None and price <= 150:
-                return True, categoria, titulo, price, "DDR4 8GB ≤ 150", False
-            return False, categoria, titulo, price, "DDR4 8GB > 150 ou sem preço", False
-
-    # SSD 1TB NVMe/M.2 ≤ 460
-    if SSD_RE.search(t) and ONE_TB_RE.search(t) and NVME_M2_RE.search(t):
-        categoria = "SSD 1TB NVMe/M.2"
-        titulo = "SSD 1TB NVMe/M.2"
-        if price is not None and price <= 460:
-            return True, categoria, titulo, price, "SSD 1TB ≤ 460", False
-        return False, categoria, titulo, price, "SSD 1TB > 460 ou sem preço", False
-
-    # GABINETE: 3 fans ≤ 160; 4+ fans ≤ 220
-    if GABINETE_RE.search(t):
-        categoria = "Gabinete"
-        titulo = "Gabinete (com fans)"
-        fans = count_fans(t)
-        if price is None:
-            return False, categoria, titulo, None, "gabinete sem preço", False
-        if fans >= 4 and price <= 220:
-            return True, categoria, f"Gabinete {fans} fans", price, "≥4 fans ≤ 220", False
-        if fans >= 3 and price <= 160:
-            return True, categoria, f"Gabinete {fans} fans", price, "≥3 fans ≤ 160", False
-        return False, categoria, f"Gabinete {fans or 0} fans", price, "gabinete fora das regras", False
-
-    # Water cooler ≤ 200
-    if WATER_COOLER_RE.search(t):
-        categoria = "Water Cooler"
-        titulo = "Water Cooler"
-        if price is not None and price <= 200:
-            return True, categoria, titulo, price, "Water cooler ≤ 200", False
-        return False, categoria, titulo, price, "Water cooler > 200 ou sem preço", False
-
-    # Teclado Redragon (superiores ao Kumara) ≤ 160 — IGNORA se > 160
-    if REDRAGON_RE.search(t):
-        categoria = "Teclado"
-        titulo = "Redragon"
-        if KUMARA_RE.search(t):
-            return False, categoria, "Kumara", price, "Kumara bloqueado (apenas superiores)", False
-        if price is not None and price <= 160:
-            return True, categoria, "Redragon (não Kumara)", price, "Teclado Redragon ≤ 160", False
-        return False, categoria, "Redragon (não Kumara)", price, "Teclado Redragon > 160 ou sem preço", False
-
-    # PS5 — sempre alerta (sem cabeçalho)
-    if PS5_RE.search(t):
-        categoria = "Console"
-        titulo = "PS5"
-        return True, categoria, titulo, price, "PS5", False
-
-    # Sem match
-    return False, "Outros", "—", price, "sem match", False
-
-# ---------------------------------------------
-# DUP GUARD
-# ---------------------------------------------
-class LRUSeen:
-    def __init__(self, maxlen: int = 500):
-        self.maxlen = maxlen
-        self.map: Dict[int, float] = {}
-
-    def seen(self, msg_id: int) -> bool:
-        if msg_id in self.map:
-            return True
-        if len(self.map) > self.maxlen:
-            # limpa metade mais antiga
-            for k, _ in sorted(self.map.items(), key=lambda kv: kv[1])[: self.maxlen // 2]:
-                self.map.pop(k, None)
-        self.map[msg_id] = time.time()
+    if price is None:
         return False
 
-seen_cache = LRUSeen()
+    # GPUs
+    if product_key == "gpu:rtx5060" and price < 1900:
+        return True
+    if product_key == "gpu:rtx5070" and price < 3700:
+        return True
+
+    # CPUs
+    if product_key.startswith("cpu:intel") and price < 899:
+        return True
+    if product_key.startswith("cpu:amd") and price < 899:
+        return True
+
+    # MOBOS top
+    if product_key in ("mobo:am4:top", "mobo:lga1700:top") and price < 550:
+        return True
+
+    return False
+
+# ---------------------------------------------
+# MATCH
+# ---------------------------------------------
+def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str, str]:
+    """
+    Retorna:
+      ok, product_key, title, price, reason, display_title
+    product_key: para logs/cooldown
+    title: nome "confiável" do produto encontrado
+    display_title: texto curto exibido no log
+    """
+    t = text
+    price = find_lowest_price(t)
+    channel_reason = ""
+
+    # GPUs
+    if RTX5060_RE.search(t):
+        return True, "gpu:rtx5060", "RTX 5060", price, "GPU RTX 5060 detectada", "RTX 5060"
+    if RTX5070_RE.search(t):
+        return True, "gpu:rtx5070", "RTX 5070", price, "GPU RTX 5070 detectada", "RTX 5070"
+    if RX7600_RE.search(t):
+        return True, "gpu:rx7600", "RX 7600", price, "GPU RX 7600 detectada", "RX 7600"
+
+    # CPUs Intel (inclui 12400F/12600F/KF/14400F/superiores)
+    if INTEL_14400F.search(t) or INTEL_12600F_KF.search(t) or INTEL_12400F.search(t) or INTEL_ANY_SUP.search(t):
+        if price is not None and price <= 900:
+            return True, "cpu:intel", "CPU Intel (i5/i7/i9)", price, f"CPU Intel ≤ 900 (R$ {price:.2f})", "CPU Intel"
+        else:
+            return False, "cpu:intel", "CPU Intel (i5/i7/i9)", price, "CPU Intel com preço > 900 ou ausente", "CPU Intel"
+
+    # CPUs AMD (AM4 sup)
+    if AMD_SUP.search(t):
+        if price is not None and price <= 900:
+            return True, "cpu:amd", "CPU AMD (AM4 sup.)", price, f"CPU AMD ≤ 900 (R$ {price:.2f})", "CPU AMD"
+        else:
+            return False, "cpu:amd", "CPU AMD (AM4 sup.)", price, "CPU AMD com preço > 900 ou ausente", "CPU AMD"
+
+    # MOBOS
+    if A520_RE.search(t):
+        return False, "mobo:am4", "Placa-mãe A520", price, "A520 bloqueada", "A520"
+
+    if B550_RE.search(t):
+        if price is not None and price < 550:
+            return True, "mobo:am4", "Placa-mãe B550", price, f"B550 < 550 (R$ {price:.2f})", "B550"
+        else:
+            return False, "mobo:am4", "Placa-mãe B550", price, "B550 ≥ 550 ou sem preço", "B550"
+
+    # MOBOS top
+    if (AM4_TOP.search(t) and B550_RE.search(t)):
+        if price is not None and price < 550:
+            return True, "mobo:am4:top", "Placa-mãe AM4 TOP", price, f"Top AM4 < 550 (R$ {price:.2f})", "AM4 TOP"
+        else:
+            return False, "mobo:am4:top", "Placa-mãe AM4 TOP", price, "Top AM4 ≥ 550 ou sem preço", "AM4 TOP"
+
+    if LGA1700.search(t):
+        if AM4_TOP.search(t):
+            # às vezes citam família "top" junto; mantemos lógica com preço
+            if price is not None and price < 550:
+                return True, "mobo:lga1700:top", "Placa-mãe LGA1700 TOP", price, f"Top LGA1700 < 550 (R$ {price:.2f})", "LGA1700 TOP"
+            else:
+                return False, "mobo:lga1700:top", "Placa-mãe LGA1700 TOP", price, "Top LGA1700 ≥ 550 ou sem preço", "LGA1700 TOP"
+        # comuns (H/B/Z) — não alertamos por padrão (apenas top)
+        return False, "mobo:lga1700", "Placa-mãe LGA1700", price, "LGA1700 comum (apenas top alerta)", "LGA1700"
+
+    # GABINETE
+    if GAB_RE.search(t):
+        fans = count_fans(t)
+        if price is None:
+            return False, "case", "Gabinete", price, "Gabinete sem preço", "Gabinete"
+        # 3 fans até 160; 4+ fans até 220
+        if (fans == 3 and price <= 160) or (fans >= 4 and price <= 220):
+            return True, "case", f"Gabinete ({fans} fans)", price, f"Gabinete {fans} fans OK (R$ {price:.2f})", "Gabinete"
+        else:
+            return False, "case", f"Gabinete ({fans or 's/ info'} fans)", price, "Gabinete fora das regras", "Gabinete"
+
+    # WATER COOLER
+    if WATER_RE.search(t):
+        if price is not None and price <= 200:
+            return True, "cooler:water", "Water cooler", price, f"Water cooler ≤ 200 (R$ {price:.2f})", "Water cooler"
+        else:
+            return False, "cooler:water", "Water cooler", price, "Water cooler > 200 ou sem preço", "Water cooler"
+
+    # SSD NVMe M.2 1TB
+    if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
+        if price is not None and price <= 460:
+            return True, "ssd:m2:1tb", "SSD NVMe M.2 1TB", price, f"SSD M.2 1TB ≤ 460 (R$ {price:.2f})", "SSD M.2 1TB"
+        else:
+            return False, "ssd:m2:1tb", "SSD NVMe M.2 1TB", price, "SSD 1TB > 460 ou sem preço", "SSD M.2 1TB"
+
+    # RAM DDR4 (16GB ≤ 300, 8GB ≤ 150)
+    if (RAM_RE.search(t) or DDR4_RE.search(t)) and DDR4_RE.search(t):
+        if GB16_RE.search(t):
+            if price is not None and price <= 300:
+                return True, "ram:ddr4:16", "Memória DDR4 16GB", price, f"DDR4 16GB ≤ 300 (R$ {price:.2f})", "DDR4 16GB"
+            else:
+                return False, "ram:ddr4:16", "Memória DDR4 16GB", price, "DDR4 16GB > 300 ou sem preço", "DDR4 16GB"
+        if GB8_RE.search(t):
+            if price is not None and price <= 150:
+                return True, "ram:ddr4:8", "Memória DDR4 8GB", price, f"DDR4 8GB ≤ 150 (R$ {price:.2f})", "DDR4 8GB"
+            else:
+                return False, "ram:ddr4:8", "Memória DDR4 8GB", price, "DDR4 8GB > 150 ou sem preço", "DDR4 8GB"
+
+    # PS5 (exemplo, não tem limite aqui)
+    if PS5_RE.search(t):
+        return True, "console:ps5", "PlayStation 5", price, "PS5 detectado", "PS5"
+
+    return False, "none", "Desconhecido", price, "sem match", "sem match"
+
+# ---------------------------------------------
+# Anti-duplicado simples
+# ---------------------------------------------
+class Seen:
+    def __init__(self, maxlen=500):
+        self.maxlen = maxlen
+        self._d: Dict[int, float] = {}
+
+    def is_dup(self, msg_id: int) -> bool:
+        if msg_id in self._d:
+            return True
+        if len(self._d) > self.maxlen:
+            # limpa metade mais antiga
+            items = sorted(self._d.items(), key=lambda kv: kv[1])[: self.maxlen // 2]
+            for k, _ in items:
+                self._d.pop(k, None)
+        self._d[msg_id] = time.time()
+        return False
+
+seen = Seen()
 
 # ---------------------------------------------
 # MAIN
@@ -406,57 +369,54 @@ def main():
     log.info("Conectando ao Telegram...")
     with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
         log.info("Conectado.")
-        dialogs = client.get_dialogs()
 
-        username_to_entity = {}
+        dialogs = client.get_dialogs()
+        uname2entity = {}
         for d in dialogs:
             try:
                 if d.entity and getattr(d.entity, "username", None):
-                    username_to_entity["@{}".format(d.entity.username.lower())] = d.entity
-            except:
+                    uname2entity["@{}".format(d.entity.username.lower())] = d.entity
+            except Exception:
                 pass
 
-        resolved_entities = []
-        for uname in MONITORED_USERNAMES:
-            ent = username_to_entity.get(uname)
+        resolved = []
+        for u in MONITORED_USERNAMES:
+            ent = uname2entity.get(u)
             if ent is None:
-                log.warning("Canal não encontrado (ignorado): %s", uname)
+                log.warning("Canal não encontrado (ignorado): %s", u)
             else:
-                resolved_entities.append(ent)
+                resolved.append(ent)
 
-        if resolved_entities:
-            log.info("▶️ Canais resolvidos: " + ", ".join(f"@{getattr(e, 'username', '')}" for e in resolved_entities if getattr(e, "username", None)))
+        if resolved:
+            log.info("▶️ Canais resolvidos: " + ", ".join(f"@{getattr(e,'username','')}" for e in resolved if getattr(e,'username',None)))
         else:
             log.info("▶️ Canais resolvidos: ")
-        log.info("✅ Logado — monitorando %d canais…", len(resolved_entities))
+        log.info("✅ Logado — monitorando %d canais…", len(resolved))
         log.info("▶️ Rodando. Pressione Ctrl+C para sair.")
 
-        @client.on(events.NewMessage(chats=resolved_entities if resolved_entities else None))
+        @client.on(events.NewMessage(chats=resolved if resolved else None))
         async def handler(event):
             try:
-                if seen_cache.seen(event.id):
+                if seen.is_dup(event.id):
                     return
-                raw_text = (event.raw_text or "").strip()
-                if not raw_text:
+                text = (event.raw_text or "").strip()
+                if not text:
                     return
-                chan_user = getattr(event.chat, "username", None)
-                chan_disp = f"@{chan_user}" if chan_user else "(desconhecido)"
 
-                is_match, categoria, titulo, price, motivo, use_hdr = classify_and_match(raw_text)
+                ok, pkey, title, price, reason, short_name = classify_and_match(text)
 
-                # LOG detalhado
-                if is_match:
-                    p = f"R$ {price:.2f}" if price is not None else "R$ ?"
-                    log.info("[%-17s] MATCH → %s — %s — %s (%s)", chan_disp, categoria, titulo, p, motivo)
-                    # montar mensagem com cabeçalho e rodapé
-                    msg = raw_text
-                    if use_hdr:
-                        msg = "Corre!🔥 " + msg
-                    msg = footer_with_channel(msg, chan_user)
-                    send_alert_to_all(msg)
+                chan = getattr(event.chat, "username", None)
+                chan_disp = f"@{chan}" if chan else "(desconhecido)"
+
+                if ok:
+                    header = "Corre!🔥 " if add_header_if_needed(pkey, price) else ""
+                    to_send = f"{header}{text}\n\n— via {chan_disp}"
+                    log.info("[%-18s] MATCH → %s | price=%s | key=%s | reason=%s",
+                             chan_disp, short_name, f"{price:.2f}" if price is not None else "None", pkey, reason)
+                    notify_all(to_send)
                 else:
-                    p = f"R$ {price:.2f}" if price is not None else "R$ ?"
-                    log.info("[%-17s] IGNORADO → %s — %s — %s (%s)", chan_disp, categoria, titulo, p, motivo)
+                    log.info("[%-18s] IGNORADO → %s | price=%s | key=%s | reason=%s",
+                             chan_disp, short_name, f"{price:.2f}" if price is not None else "None", pkey, reason)
 
             except Exception as e:
                 log.exception("Handler error: %s", e)
