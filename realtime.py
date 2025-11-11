@@ -128,13 +128,19 @@ def find_lowest_price(text: str) -> Optional[float]:
 # ---------------------------------------------
 # REGEX / REGRAS
 # ---------------------------------------------
+# BLOQUEIO de PC gamer / montado
+PC_GAMER_RE = re.compile(
+    r"\bpc\s*gamer\b|\bcomputador\s*gamer\b|\bsetup\s*completo\b|\bkit\s*completo\b",
+    re.IGNORECASE,
+)
+
 # GPUs
-RTX5050_RE = re.compile(r"\brtx\s*5050\b", re.IGNORECASE)   # NOVO
+RTX5050_RE = re.compile(r"\brtx\s*5050\b", re.IGNORECASE)
 RTX5060_RE = re.compile(r"\brtx\s*5060\b", re.IGNORECASE)
 RTX5070_RE = re.compile(r"\brtx\s*5070\b", re.IGNORECASE)
 RX7600_RE  = re.compile(r"\brx\s*7600\b", re.IGNORECASE)
 
-# CPUs Intel
+# CPUs Intel (superiores)
 INTEL_ANY_SUP = re.compile(
     r"""\b(?:
         i5[-\s]*12(?:600|700)k?f? |
@@ -147,11 +153,8 @@ INTEL_ANY_SUP = re.compile(
     )\b""",
     re.IGNORECASE | re.VERBOSE
 )
-INTEL_14400F = re.compile(r"\bi5[-\s]*14400k?f?\b", re.IGNORECASE)
-INTEL_12600F_KF = re.compile(r"\bi5[-\s]*12600k?f?\b", re.IGNORECASE)
-INTEL_12400F = re.compile(r"\bi5[-\s]*12400f\b", re.IGNORECASE)
 
-# CPUs AMD (AM4 sup.)
+# CPUs AMD (AM4 superiores)
 AMD_SUP = re.compile(
     r"""\b(?:
         ryzen\s*7\s*5700x? |
@@ -161,12 +164,13 @@ AMD_SUP = re.compile(
     )\b""",
     re.IGNORECASE | re.VERBOSE
 )
+# BLOQUEIO explícito de Ryzen 3/5 e 5600/5600G/5600GT
+AMD_BLOCK = re.compile(r"\bryzen\s*(?:3|5)\b|\b5600g?t?\b", re.IGNORECASE)
 
 # MOBOS
 A520_RE = re.compile(r"\ba520m?\b", re.IGNORECASE)
-B550_RE = re.compile(r"\bb550m?\b", re.IGNORECASE)
-AM4_TOP = re.compile(r"\b(?:tuf|elite|aorus|tomahawk|steel\s*legend|strix|prime)\b", re.IGNORECASE)
-LGA1700 = re.compile(r"\b(?:h610|b660|b760|z690|z790)\b", re.IGNORECASE)
+B550_RE = re.compile(r"\bb550m?\b|\bx570\b", re.IGNORECASE)
+LGA1700_CHIP = re.compile(r"\b(?:h610|b660|b760|z690|z790)\b", re.IGNORECASE)
 
 # GABINETE
 GAB_RE = re.compile(r"\bgabinete\b", re.IGNORECASE)
@@ -194,7 +198,7 @@ DDR4_RE  = re.compile(r"\bddr\s*4\b|\bddr4\b", re.IGNORECASE)
 GB16_RE  = re.compile(r"\b16\s*gb\b|\b16gb\b", re.IGNORECASE)
 GB8_RE   = re.compile(r"\b8\s*gb\b|\b8gb\b", re.IGNORECASE)
 
-# PS5 (exemplo)
+# PS5 (opcional)
 PS5_RE = re.compile(r"\bps5\b|\bplaystation\s*5\b", re.IGNORECASE)
 
 # ---------------------------------------------
@@ -209,21 +213,17 @@ def count_fans(text: str) -> int:
     return n
 
 def add_header_if_needed(product_key: str, price: Optional[float]) -> bool:
+    """Cabeçalho 'Corre!🔥' apenas em 5060 < 1900 e CPUs sup < 899.
+       (REMOVIDO para 5070, como solicitado)."""
     if price is None:
         return False
-    # GPUs com header especial
     if product_key == "gpu:rtx5060" and price < 1900:
         return True
-    if product_key == "gpu:rtx5070" and price < 3700:
-        return True
-    # CPUs com header especial
     if product_key.startswith("cpu:intel") and price < 899:
         return True
     if product_key.startswith("cpu:amd") and price < 899:
         return True
-    # MOBOS top com header especial
-    if product_key in ("mobo:am4:top", "mobo:lga1700:top") and price < 550:
-        return True
+    # MOBOS top já não tem header especial aqui (pedido atual é apenas preço < 550)
     return False
 
 # ---------------------------------------------
@@ -237,62 +237,66 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str,
     t = text
     price = find_lowest_price(t)
 
+    # BLOQUEIO de PC gamer / computador montado
+    if PC_GAMER_RE.search(t):
+        return False, "block:pcgamer", "PC Gamer/Montado", price, "PC gamer/kit completo bloqueado", "PC Gamer"
+
     # GPUs
     if RTX5050_RE.search(t):
-        # ALERTA quando <= 1600 (sem cabeçalho especial)
         if price is not None and price <= 1600:
             return True, "gpu:rtx5050", "RTX 5050", price, f"RTX 5050 ≤ 1600 (R$ {price:.2f})", "RTX 5050"
         else:
             return False, "gpu:rtx5050", "RTX 5050", price, "RTX 5050 > 1600 ou sem preço", "RTX 5050"
 
     if RTX5060_RE.search(t):
+        # 5060 alerta sempre; header só se < 1900
         return True, "gpu:rtx5060", "RTX 5060", price, "GPU RTX 5060 detectada", "RTX 5060"
 
     if RTX5070_RE.search(t):
-        return True, "gpu:rtx5070", "RTX 5070", price, "GPU RTX 5070 detectada", "RTX 5070"
+        # NÃO colocar 'Corre!' aqui. Só alerta se < 3860.
+        if price is not None and price < 3860:
+            return True, "gpu:rtx5070", "RTX 5070", price, f"RTX 5070 < 3860 (R$ {price:.2f})", "RTX 5070"
+        else:
+            return False, "gpu:rtx5070", "RTX 5070", price, "RTX 5070 ≥ 3860 ou sem preço", "RTX 5070"
 
     if RX7600_RE.search(t):
         return True, "gpu:rx7600", "RX 7600", price, "GPU RX 7600 detectada", "RX 7600"
 
-    # CPUs Intel (12400F/12600F-KF/14400F/superiores)
-    if INTEL_14400F.search(t) or INTEL_12600F_KF.search(t) or INTEL_12400F.search(t) or INTEL_ANY_SUP.search(t):
-        if price is not None and price <= 900:
-            return True, "cpu:intel", "CPU Intel (i5/i7/i9)", price, f"CPU Intel ≤ 900 (R$ {price:.2f})", "CPU Intel"
-        else:
-            return False, "cpu:intel", "CPU Intel (i5/i7/i9)", price, "CPU Intel com preço > 900 ou ausente", "CPU Intel"
+    # CPUs AMD inferiores — bloquear antes
+    if re.search(r"\bryzen\b", t, re.IGNORECASE) and AMD_BLOCK.search(t):
+        return False, "cpu:amd:block", "CPU AMD inferior", price, "Ryzen 3/5 bloqueado (ex.: 5600/5600G/5600GT)", "CPU AMD (bloq)"
 
-    # CPUs AMD (AM4 sup.)
+    # CPUs Intel (apenas superiores) — < 900
+    if INTEL_ANY_SUP.search(t):
+        if price is not None and price < 900:
+            return True, "cpu:intel", "CPU Intel (sup.)", price, f"CPU Intel < 900 (R$ {price:.2f})", "CPU Intel"
+        else:
+            return False, "cpu:intel", "CPU Intel (sup.)", price, "CPU Intel ≥ 900 ou sem preço", "CPU Intel"
+
+    # CPUs AMD (apenas superiores) — < 900
     if AMD_SUP.search(t):
-        if price is not None and price <= 900:
-            return True, "cpu:amd", "CPU AMD (AM4 sup.)", price, f"CPU AMD ≤ 900 (R$ {price:.2f})", "CPU AMD"
+        if price is not None and price < 900:
+            return True, "cpu:amd", "CPU AMD (AM4 sup.)", price, f"CPU AMD < 900 (R$ {price:.2f})", "CPU AMD"
         else:
-            return False, "cpu:amd", "CPU AMD (AM4 sup.)", price, "CPU AMD com preço > 900 ou ausente", "CPU AMD"
+            return False, "cpu:amd", "CPU AMD (AM4 sup.)", price, "CPU AMD ≥ 900 ou sem preço", "CPU AMD"
 
-    # MOBOS — bloquear A520
+    # MOBOS — sempre < 550; A520 bloqueada
     if A520_RE.search(t):
         return False, "mobo:am4", "Placa-mãe A520", price, "A520 bloqueada", "A520"
 
-    # B550 < 550
+    # AM4 (B550/X570) < 550
     if B550_RE.search(t):
         if price is not None and price < 550:
-            return True, "mobo:am4", "Placa-mãe B550", price, f"B550 < 550 (R$ {price:.2f})", "B550"
+            return True, "mobo:am4", "Placa-mãe AM4 (B550/X570)", price, f"AM4 (B550/X570) < 550 (R$ {price:.2f})", "AM4 (B550/X570)"
         else:
-            return False, "mobo:am4", "Placa-mãe B550", price, "B550 ≥ 550 ou sem preço", "B550"
+            return False, "mobo:am4", "Placa-mãe AM4 (B550/X570)", price, "AM4 (B550/X570) ≥ 550 ou sem preço", "AM4 (B550/X570)"
 
-    # MOBOS top (AM4 e LGA1700) < 550
-    if (AM4_TOP.search(t) and B550_RE.search(t)):
+    # LGA1700 (H610/B660/B760/Z690/Z790) < 550
+    if LGA1700_CHIP.search(t):
         if price is not None and price < 550:
-            return True, "mobo:am4:top", "Placa-mãe AM4 TOP", price, f"Top AM4 < 550 (R$ {price:.2f})", "AM4 TOP"
+            return True, "mobo:lga1700", "Placa-mãe LGA1700 (H610/B660/B760/Z690/Z790)", price, f"LGA1700 < 550 (R$ {price:.2f})", "LGA1700"
         else:
-            return False, "mobo:am4:top", "Placa-mãe AM4 TOP", price, "Top AM4 ≥ 550 ou sem preço", "AM4 TOP"
-
-    if LGA1700.search(t):
-        if AM4_TOP.search(t):
-            if price is not None and price < 550:
-                return True, "mobo:lga1700:top", "Placa-mãe LGA1700 TOP", price, f"Top LGA1700 < 550 (R$ {price:.2f})", "LGA1700 TOP"
-            else:
-                return False, "mobo:lga1700:top", "Placa-mãe LGA1700 TOP", price, "Top LGA1700 ≥ 550 ou sem preço", "LGA1700 TOP"
-        return False, "mobo:lga1700", "Placa-mãe LGA1700", price, "LGA1700 comum (apenas top alerta)", "LGA1700"
+            return False, "mobo:lga1700", "Placa-mãe LGA1700", price, "LGA1700 ≥ 550 ou sem preço", "LGA1700"
 
     # GABINETE — 3 fans ≤ 160; 4+ fans ≤ 220
     if GAB_RE.search(t):
@@ -304,19 +308,19 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str,
         else:
             return False, "case", f"Gabinete ({fans or 's/ info'} fans)", price, "Gabinete fora das regras", "Gabinete"
 
-    # WATER COOLER ≤ 200
+    # WATER COOLER ≤ 150
     if WATER_RE.search(t):
-        if price is not None and price <= 200:
-            return True, "cooler:water", "Water cooler", price, f"Water cooler ≤ 200 (R$ {price:.2f})", "Water cooler"
+        if price is not None and price <= 150:
+            return True, "cooler:water", "Water cooler", price, f"Water cooler ≤ 150 (R$ {price:.2f})", "Water cooler"
         else:
-            return False, "cooler:water", "Water cooler", price, "Water cooler > 200 ou sem preço", "Water cooler"
+            return False, "cooler:water", "Water cooler", price, "Water cooler > 150 ou sem preço", "Water cooler"
 
-    # COOLER (ar) ≤ 130 — só se mencionar "cooler" e NÃO mencionar "water cooler"
+    # COOLER (ar) ≤ 150 — só se mencionar "cooler" e NÃO "water"
     if AIR_COOLER_RE.search(t) and not WATER_RE.search(t):
-        if price is not None and price <= 130:
-            return True, "cooler:air", "Cooler (ar)", price, f"Cooler (ar) ≤ 130 (R$ {price:.2f})", "Cooler (ar)"
+        if price is not None and price <= 150:
+            return True, "cooler:air", "Cooler (ar)", price, f"Cooler (ar) ≤ 150 (R$ {price:.2f})", "Cooler (ar)"
         else:
-            return False, "cooler:air", "Cooler (ar)", price, "Cooler (ar) > 130 ou sem preço", "Cooler (ar)"
+            return False, "cooler:air", "Cooler (ar)", price, "Cooler (ar) > 150 ou sem preço", "Cooler (ar)"
 
     # SSD NVMe M.2 1TB ≤ 460
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
@@ -338,7 +342,7 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str,
             else:
                 return False, "ram:ddr4:8", "Memória DDR4 8GB", price, "DDR4 8GB > 150 ou sem preço", "DDR4 8GB"
 
-    # PS5 (opcional)
+    # PS5 (exemplo)
     if PS5_RE.search(t):
         return True, "console:ps5", "PlayStation 5", price, "PS5 detectado", "PS5"
 
