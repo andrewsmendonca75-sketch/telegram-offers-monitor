@@ -1,61 +1,88 @@
 # -*- coding: utf-8 -*-
+"""
+realtime.py
+Monitor de canais/grupos no Telegram com filtros e alertas.
+
+Destaques:
+- Auto-bind HEALTHCHECK_PORT a partir de PORT (plataformas como Railway/Render/Heroku)
+- Servidor HTTP embutido (/healthz e /metrics) para o deploy marcar como "UP"
+- Fallback de envio: Bot API (se TELEGRAM_TOKEN) -> Telethon (mensagem direta)
+- Suporte a @usernames (MONITORED_CHANNELS) e IDs (MONITORED_CHANNEL_IDS)
+- Regras de classificação (GPU, CPU, mobo, gabinete, cooler, SSD, RAM)
+- Parser de preço robusto para BRL
+"""
+
 import os
 import re
 import time
 import json
 import logging
-import traceback
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List, Optional, Tuple, Dict, Union
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telethon import events
 from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
 
-# ---------------------------------------------
+# -----------------------------------------------------------------------------
 # LOGGING
-# ---------------------------------------------
-APP_NAME = os.getenv("APP_NAME", "monitor")
+# -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | [%(name)s] %(message)s",
 )
-log = logging.getLogger(APP_NAME)
+log = logging.getLogger(os.getenv("APP_NAME", "monitor"))
 
-# ---------------------------------------------
-# ENV / CONFIG
-# ---------------------------------------------
-def _req(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise SystemExit(f"ENV obrigatório ausente: {name}")
-    return v
-
-API_ID = int(_req("TELEGRAM_API_ID"))
-API_HASH = _req("TELEGRAM_API_HASH")
-STRING_SESSION = _req("TELEGRAM_STRING_SESSION")
-
-# Opcional: se fornecer, envia via Bot API; senão, envia com o próprio client
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-
-MONITORED_CHANNELS_RAW = os.getenv("MONITORED_CHANNELS", "")  # @user1,@user2
-MONITORED_CHANNEL_IDS_RAW = os.getenv("MONITORED_CHANNEL_IDS", "")  # 100123,-100999
-
-USER_DESTINATIONS_RAW = os.getenv("USER_DESTINATIONS", os.getenv("USER_CHAT_ID", ""))  # ids separados por vírgula
-
-HEALTHCHECK_PORT = int(os.getenv("HEALTHCHECK_PORT", "0")) or None
 VERSION = os.getenv("VERSION", "1.2.0")
 
-# ---------------------------------------------
-# HELPERS (CSV/normalização)
-# ---------------------------------------------
+# -----------------------------------------------------------------------------
+# AUTO-BIND HEALTHCHECK_PORT <- PORT
+# -----------------------------------------------------------------------------
+_port_env = os.getenv("PORT", "")
+if _port_env and not os.getenv("HEALTHCHECK_PORT"):
+    os.environ["HEALTHCHECK_PORT"] = _port_env
+
+HEALTHCHECK_PORT = os.getenv("HEALTHCHECK_PORT", "")
+METRICS = {
+    "version": VERSION,
+    "start_ts": int(time.time()),
+    "messages_seen": 0,
+    "matches_sent": 0,
+    "last_match_ts": 0,
+}
+
+# -----------------------------------------------------------------------------
+# ENV OBRIGATÓRIAS
+# -----------------------------------------------------------------------------
+def _require(name: str) -> str:
+    val = os.getenv(name, "").strip()
+    if not val:
+        log.error("Variável obrigatória ausente: %s", name)
+        raise SystemExit(1)
+    return val
+
+API_ID = int(_require("TELEGRAM_API_ID"))
+API_HASH = _require("TELEGRAM_API_HASH")
+STRING_SESSION = _require("TELEGRAM_STRING_SESSION")
+
+# Opcional: Bot API (melhor para enviar para grupos/canais por ID)
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+BOT_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+
+# Destinos de notificação (pode ser lista de IDs numéricos e/ou @usernames)
+USER_DESTINATIONS_RAW = os.getenv("USER_DESTINATIONS", os.getenv("USER_CHAT_ID", "")).strip()
+
+# Canais/Grupos monitorados
+MONITORED_CHANNELS_RAW = os.getenv("MONITORED_CHANNELS", "").strip()           # "@canal1,@canal2"
+MONITORED_CHANNEL_IDS_RAW = os.getenv("MONITORED_CHANNEL_IDS", "").strip()     # "-1001234567890,-1002222"
+
+# -----------------------------------------------------------------------------
+# HELPERS ENV
+# -----------------------------------------------------------------------------
 def _split_csv(val: str) -> List[str]:
     return [p.strip() for p in val.split(",") if p and p.strip()]
 
@@ -65,78 +92,135 @@ def _norm_username(u: str) -> Optional[str]:
     u = u.strip()
     if not u:
         return None
-    # se é puro número, não é @username
-    if re.fullmatch(r"-?\d+", u):
+    # se for só dígitos, não é username
+    if re.fullmatch(r"\d+", u):
         return None
     u = u.lower()
     if not u.startswith("@"):
-        u = "@"+u
+        u = "@" + u
     return u
 
-def _to_int_list(csv_: str) -> List[int]:
-    out: List[int] = []
-    for x in _split_csv(csv_):
-        try:
-            out.append(int(x))
-        except:
-            log.warning("Ignorando MONITORED_CHANNEL_IDS inválido: %r", x)
-    return out
-
-# Listas finais de monitoramento
+# montar listas normalizadas
 MONITORED_USERNAMES: List[str] = []
 for x in _split_csv(MONITORED_CHANNELS_RAW):
     nu = _norm_username(x)
     if nu:
         MONITORED_USERNAMES.append(nu)
 
-MONITORED_IDS: List[int] = _to_int_list(MONITORED_CHANNEL_IDS_RAW)
+MONITORED_IDS: List[int] = []
+for x in _split_csv(MONITORED_CHANNEL_IDS_RAW):
+    if re.fullmatch(r"-?\d+", x):
+        try:
+            MONITORED_IDS.append(int(x))
+        except Exception:
+            pass
+
+USER_DESTINATIONS: List[str] = _split_csv(USER_DESTINATIONS_RAW)
 
 if not MONITORED_USERNAMES and not MONITORED_IDS:
-    log.warning("MONITORED_CHANNELS/MONITORED_CHANNEL_IDS vazio(s) — nada será filtrado explicitamente.")
+    log.warning("MONITORED_CHANNELS/IDS vazio — o handler não terá filtro de chats (rastreará todos os acessíveis).")
 
-# destinos (strings, podem ser @user ou id numérico)
-USER_DESTINATIONS: List[str] = _split_csv(USER_DESTINATIONS_RAW)
 if not USER_DESTINATIONS:
-    log.warning("USER_DESTINATIONS/USER_CHAT_ID não definido; nada será enviado.")
+    log.warning("USER_DESTINATIONS/USER_CHAT_ID não definido; os matches não serão enviados (apenas logados).")
+else:
+    log.info("📬 Destinos: %s", ", ".join(USER_DESTINATIONS))
 
-# ---------------------------------------------
-# HTTP (Bot API) com retry/backoff
-# ---------------------------------------------
-BOT_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
-_session = None
-if BOT_TOKEN:
-    _session = requests.Session()
-    retry = Retry(
-        total=5,
-        backoff_factor=0.7,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["POST", "GET"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
-    _session.mount("https://", adapter)
-    _session.mount("http://", adapter)
+if MONITORED_USERNAMES:
+    log.info("▶️ Canais/Grupos (@): %s", ", ".join(MONITORED_USERNAMES))
+if MONITORED_IDS:
+    log.info("▶️ Canais/Grupos (IDs): %s", ", ".join(str(i) for i in MONITORED_IDS))
 
-def _tg_send_via_bot(dest: str, text: str) -> Tuple[bool, str]:
-    if not BOT_TOKEN:
+# -----------------------------------------------------------------------------
+# HEALTHCHECK SERVER
+# -----------------------------------------------------------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        if self.path == "/metrics":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps(METRICS).encode("utf-8"))
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        # silencia logs HTTP padrão
+        return
+
+def _start_health_server(port: int):
+    def _serve():
+        try:
+            httpd = HTTPServer(("0.0.0.0", port), _HealthHandler)
+            log.info("🌐 Healthcheck ativo em :%d (/healthz, /metrics)", port)
+            httpd.serve_forever()
+        except Exception as e:
+            log.error("Falha ao iniciar healthcheck: %r", e)
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+
+if HEALTHCHECK_PORT and re.fullmatch(r"\d+", HEALTHCHECK_PORT):
+    _start_health_server(int(HEALTHCHECK_PORT))
+
+# -----------------------------------------------------------------------------
+# BOT SENDER
+# -----------------------------------------------------------------------------
+def bot_send_text(dest: Union[str, int], text: str) -> Tuple[bool, str]:
+    if not BOT_BASE:
         return False, "BOT_TOKEN ausente"
     payload = {"chat_id": dest, "text": text, "disable_web_page_preview": True}
     try:
-        r = _session.post(f"{BOT_BASE}/sendMessage", json=payload, timeout=20)
+        r = requests.post(f"{BOT_BASE}/sendMessage", json=payload, timeout=20)
         if r.status_code == 200 and r.json().get("ok"):
             return True, "ok"
         return False, r.text
     except Exception as e:
         return False, repr(e)
 
-# ---------------------------------------------
-# PRICE PARSER (BRL)
-# ---------------------------------------------
+async def client_send_text(client: TelegramClient, dest: str, text: str) -> Tuple[bool, str]:
+    """Envia via Telethon como fallback. 'dest' pode ser ID numérico ('-100...') ou '@user/@canal'."""
+    try:
+        target: Union[int, str]
+        if re.fullmatch(r"-?\d+", str(dest)):
+            target = int(dest)
+        else:
+            target = dest
+        entity = await client.get_entity(target)
+        await client.send_message(entity, text)
+        return True, "ok"
+    except Exception as e:
+        return False, repr(e)
+
+async def notify_all(client: TelegramClient, text: str):
+    if not USER_DESTINATIONS:
+        log.info("Nenhum destino configurado; mensagem não enviada.")
+        return
+    for d in USER_DESTINATIONS:
+        ok, msg = bot_send_text(d, text)
+        if ok:
+            log.info("· envio=ok(bot) → %s", d)
+            continue
+        # fallback
+        ok2, msg2 = await client_send_text(client, d, text)
+        if ok2:
+            log.info("· envio=ok(client) → %s", d)
+        else:
+            log.error("· envio=ERRO → %s | bot=%s | client=%s", d, msg, msg2)
+
+# -----------------------------------------------------------------------------
+# PRICE PARSER
+# -----------------------------------------------------------------------------
 PRICE_RE = re.compile(
     r"(?i)(r\$\s*)?("
-    r"(?:\d{1,3}(?:\.\d{3})+(?:,\d{2})?)"
-    r"|(?:\d{3,}(?:,\d{2})?)"
-    r"|(?:\d+,\d{2})"
+    r"(?:\d{1,3}(?:\.\d{3})+(?:,\d{2})?)"   # 1.234,56
+    r"|(?:\d{3,}(?:,\d{2})?)"               # 1234,56  / 1234
+    r"|(?:\d+,\d{2})"                       # 99,90
     r")"
 )
 
@@ -144,9 +228,8 @@ def _to_float_brl(raw: str) -> Optional[float]:
     s = raw.strip().replace(".", "").replace(",", ".")
     try:
         v = float(s)
-        # limites de sanidade
         return v if 0 < v < 100000 else None
-    except:
+    except Exception:
         return None
 
 def find_lowest_price(text: str) -> Optional[float]:
@@ -154,21 +237,20 @@ def find_lowest_price(text: str) -> Optional[float]:
     for m in PRICE_RE.finditer(text):
         has_r = bool(m.group(1))
         raw = m.group(2)
-        # ignora 1.099 (milhar ponto, sem vírgula e sem R$)
+        # evita números estilo milhar sem vírgula como preço sem "R$"
         if "." in raw and "," not in raw and not has_r:
             continue
         v = _to_float_brl(raw)
         if not v or v < 5:
             continue
-        # < 100 sem R$ costuma ser “frete 50,00”, etc.
         if v < 100 and not has_r:
             continue
         vals.append(v)
     return min(vals) if vals else None
 
-# ---------------------------------------------
-# REGEX / REGRAS
-# ---------------------------------------------
+# -----------------------------------------------------------------------------
+# REGEX DE CLASSIFICAÇÃO
+# -----------------------------------------------------------------------------
 BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook)\b", re.I)
 PC_GAMER_RE = re.compile(r"\b(pc\s*gamer|setup\s*completo|kit\s*completo)\b", re.I)
 
@@ -219,7 +301,6 @@ def needs_header(product_key: str, price: Optional[float]) -> bool:
 
 def classify_and_match(text: str):
     t = text
-    # Blocks
     if BLOCK_CATS.search(t):
         return False, "block:cat", "Categoria bloqueada", None, "celular/notebook etc."
     if PC_GAMER_RE.search(t):
@@ -227,7 +308,7 @@ def classify_and_match(text: str):
 
     price = find_lowest_price(t)
 
-    # Prioridades
+    # PRIORIDADES
     if SPECIFIC_B760M_RE.search(t):
         if price and price < 1000:
             return True, "mobo:b760m", "B760M", price, "< 1000"
@@ -310,18 +391,19 @@ def classify_and_match(text: str):
 
     return False, "none", "sem match", price, "sem match"
 
-# ---------------------------------------------
+# -----------------------------------------------------------------------------
 # DUP GUARD
-# ---------------------------------------------
+# -----------------------------------------------------------------------------
 class Seen:
     def __init__(self, maxlen=1200):
         self.maxlen = maxlen
         self.data: Dict[int, float] = {}
+
     def is_dup(self, msg_id: int) -> bool:
         if msg_id in self.data:
             return True
+        # limpeza simples para não crescer infinito
         if len(self.data) > self.maxlen:
-            # prune metade
             for k in list(self.data)[: self.maxlen // 2]:
                 del self.data[k]
         self.data[msg_id] = time.time()
@@ -329,201 +411,96 @@ class Seen:
 
 seen = Seen()
 
-# ---------------------------------------------
-# HEALTHCHECK / METRICS
-# ---------------------------------------------
-_metrics = {"starts": 0, "messages": 0, "matches": 0, "errors": 0, "uptime_start": 0}
-
-class _HC(BaseHTTPRequestHandler):
-    def _json(self, code, payload):
-        body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def do_GET(self):
-        if self.path == "/healthz":
-            self._json(200, {"ok": True, "app": APP_NAME, "version": VERSION})
-        elif self.path == "/metrics":
-            out = dict(_metrics)
-            out["uptime_s"] = int(time.time() - _metrics["uptime_start"]) if _metrics["uptime_start"] else 0
-            self._json(200, out)
-        else:
-            self._json(404, {"ok": False})
-
-def _start_hc(port: int):
-    def _run():
-        try:
-            srv = HTTPServer(("0.0.0.0", port), _HC)
-            log.info("Healthcheck em 0.0.0.0:%d (/healthz, /metrics)", port)
-            srv.serve_forever()
-        except Exception:
-            log.exception("Healthcheck falhou")
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-
-# ---------------------------------------------
-# SENDER (destinos)
-# ---------------------------------------------
-TG_MAX = 4096
-
-def _chunk(text: str, size: int = TG_MAX) -> List[str]:
-    if len(text) <= size:
-        return [text]
-    parts = []
-    cur = 0
-    while cur < len(text):
-        parts.append(text[cur:cur+size])
-        cur += size
-    return parts
-
-async def send_to_all(client: TelegramClient, text: str):
-    # Se tiver BOT_TOKEN, tenta via Bot API; se falhar ou não tiver, usa o client
-    if BOT_TOKEN:
-        all_ok = True
-        for d in USER_DESTINATIONS:
-            for part in _chunk(text):
-                ok, msg = _tg_send_via_bot(d, part)
-                if ok:
-                    log.info("· envio(bot)=ok → %s", d)
-                else:
-                    all_ok = False
-                    log.error("· envio(bot)=ERRO → %s | %s", d, msg)
-        if all_ok:
-            return
-
-    # fallback / modo sem token
-    for d in USER_DESTINATIONS:
-        try:
-            for part in _chunk(text):
-                await client.send_message(d, part, link_preview=False)
-            log.info("· envio(client)=ok → %s", d)
-        except Exception as e:
-            log.error("· envio(client)=ERRO → %s | %s", d, repr(e))
-
-def build_link(event) -> str:
-    try:
-        chan = getattr(event.chat, "username", None)
-        if chan:
-            return f"https://t.me/{chan}/{event.id}"
-    except:
-        pass
-    return ""
-
-# ---------------------------------------------
+# -----------------------------------------------------------------------------
 # MAIN
-# ---------------------------------------------
+# -----------------------------------------------------------------------------
 def main():
-    if HEALTHCHECK_PORT:
-        _start_hc(HEALTHCHECK_PORT)
-
-    _metrics["starts"] += 1
-    _metrics["uptime_start"] = time.time()
-
-    log.info("Conectando ao Telegram…")
+    log.info("Iniciando v%s — health_port=%s", VERSION, HEALTHCHECK_PORT or "off")
     with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
-        log.info("Conectado.")
+        log.info("Conectando ao Telegram…")
+        client.connect()
+        if not client.is_user_authorized():
+            log.error("STRING_SESSION inválida/expirada — gere novamente.")
+            raise SystemExit(2)
+        me = client.get_me()
+        log.info("Conectado como: %s (id=%s)", getattr(me, "username", None) or me.first_name, me.id)
 
-        # --- Resolver canais monitorados
+        # Resolver usernames para entidades
         resolved_entities = []
+        uname2ent: Dict[str, object] = {}
+        try:
+            dialogs = client.get_dialogs()
+            for d in dialogs:
+                uname = getattr(d.entity, "username", None)
+                if uname:
+                    uname2ent[f"@{uname.lower()}"] = d.entity
+        except Exception as e:
+            log.warning("Falha ao carregar diálogos: %r (seguiremos com resolução on-demand)", e)
 
-        # 1) por username (resolve mesmo fora dos diálogos)
         for u in MONITORED_USERNAMES:
-            try:
-                ent = client.get_entity(u)
-                resolved_entities.append(ent)
-            except Exception as e:
-                log.error("Falha ao resolver %s: %s", u, repr(e))
+            if u in uname2ent:
+                resolved_entities.append(uname2ent[u])
+            else:
+                try:
+                    ent = client.get_entity(u)
+                    resolved_entities.append(ent)
+                except Exception as e:
+                    log.warning("Não foi possível resolver %s: %r", u, e)
 
-        # 2) por ID numérico
+        # Adiciona IDs direto
         for cid in MONITORED_IDS:
             try:
                 ent = client.get_entity(cid)
                 resolved_entities.append(ent)
             except Exception as e:
-                log.error("Falha ao resolver id %s: %s", cid, repr(e))
+                log.warning("Não foi possível resolver ID %s: %r", cid, e)
 
-        # Log do que foi resolvido
-        labels = []
-        for ent in resolved_entities:
-            username = getattr(ent, "username", None)
-            label = f"@{username}" if username else str(getattr(ent, "id", "unknown"))
-            labels.append(label)
-        if labels:
-            log.info("✅ Monitorando %d canais: %s", len(labels), ", ".join(labels))
+        if resolved_entities:
+            log.info("✅ Monitorando %d chats específicos.", len(resolved_entities))
         else:
-            log.warning("⚠️ Nenhum canal resolvido. O handler ainda roda (chats=None), mas só filtra por conteúdo.")
+            log.warning("⚠️ Nenhum chat resolvido — o handler ouvirá TODOS os chats acessíveis pela conta.")
 
-        # Startup alert
+        # Mensagem de boot (se tiver destino)
         try:
-            client.loop.run_until_complete(
-                send_to_all(client, f"✅ {APP_NAME} v{VERSION} iniciado e monitorando.\nCanais: {', '.join(labels) or 'nenhum resolvido'}")
-            )
-        except Exception:
-            log.exception("Falha no alerta de startup (ignorado)")
+            if USER_DESTINATIONS:
+                boot_msg = f"✅ Bot ON (v{VERSION}) — {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                client.loop.run_until_complete(notify_all(client, boot_msg))
+        except Exception as e:
+            log.warning("Falha ao enviar mensagem de boot: %r", e)
 
-        # --- Handler
         @client.on(events.NewMessage(chats=resolved_entities or None))
         async def handler(event):
-            try:
-                if seen.is_dup(event.id):
-                    return
-                text = (event.raw_text or "").strip()
-                if not text:
-                    return
+            # Contagem básica
+            METRICS["messages_seen"] += 1
 
-                _metrics["messages"] += 1
+            if seen.is_dup(event.id):
+                return
 
-                ok, key, title, price, reason = classify_and_match(text)
-                chan = getattr(event.chat, "username", None)
-                chan_disp = f"@{chan}" if chan else str(getattr(event.chat, "id", "desconhecido"))
-                link = build_link(event)
-                price_s = f"{price:.2f}" if isinstance(price, (float, int)) else "None"
+            text = (event.raw_text or "").strip()
+            if not text:
+                return
 
-                if ok:
-                    _metrics["matches"] += 1
-                    header = "Corre!🔥 " if needs_header(key, price) else ""
-                    base_msg = f"{header}{text}\n\n— via {chan_disp}"
-                    if link:
-                        base_msg += f"\n{link}"
-                    log.info("[%-18s] MATCH → %s | price=%s | key=%s | reason=%s",
-                             chan_disp, title, price_s, key, reason)
-                    await send_to_all(client, base_msg)
-                else:
-                    log.info("[%-18s] IGNORADO → %s | price=%s | key=%s | reason=%s",
-                             chan_disp, title, price_s, key, reason)
+            ok, key, title, price, reason = classify_and_match(text)
+            chan_username = getattr(event.chat, "username", None)
+            chan_disp = f"@{chan_username}" if chan_username else f"id:{getattr(event.chat, 'id', 'desconhecido')}"
 
-            except Exception as e:
-                _metrics["errors"] += 1
-                tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                if len(tb) > 1800:
-                    tb = tb[-1800:]
-                log.exception("Erro no handler")
-                with contextlib.suppress(Exception):
-                    await send_to_all(client, f"⚠️ {APP_NAME} erro no handler:\n\n{tb}")
+            if ok:
+                header = "Corre!🔥 " if needs_header(key, price) else ""
+                msg = f"{header}{text}\n\n— via {chan_disp}"
+                log.info("[%-18s] MATCH → %s | price=%s | key=%s | reason=%s",
+                         chan_disp, title, f"{price:.2f}" if price else "None", key, reason)
+                try:
+                    await notify_all(client, msg)
+                    METRICS["matches_sent"] += 1
+                    METRICS["last_match_ts"] = int(time.time())
+                except Exception as e:
+                    log.error("Falha ao notificar: %r", e)
+            else:
+                log.info("[%-18s] IGNORADO → %s | price=%s | key=%s | reason=%s",
+                         chan_disp, title, f"{price:.2f}" if price else "None", key, reason)
 
-        # run
+        log.info("Aguardando mensagens…")
         client.run_until_disconnected()
 
-# pequena dependência local para suppress sem importar muito no topo
-import contextlib
-
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as e:
-        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        if len(tb) > 1800:
-            tb = tb[-1800:]
-        log.exception("Falha fatal no main()")
-        # tentativa de alerta mesmo sem client
-        if BOT_TOKEN and USER_DESTINATIONS:
-            try:
-                for d in USER_DESTINATIONS:
-                    _tg_send_via_bot(d, f"💥 {APP_NAME} caiu no startup:\n\n{tb}")
-            except Exception:
-                pass
-        raise
+    main()
