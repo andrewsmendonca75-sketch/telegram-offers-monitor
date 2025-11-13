@@ -232,6 +232,7 @@ DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s
 WIFI_BT_RE = re.compile(r"\b(adaptador\s*wifi|adaptador\s*bluetooth|wifi\s*bluetooth|placa\s*wifi)\b", re.I)
 AR_CONDICIONADO_RE = re.compile(r"\b(ar\s*condicionado|split|inverter)\b", re.I)
 TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
+WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
 
 # ---------------------------------------------
 # HELPERS
@@ -272,14 +273,16 @@ def classify_and_match(text: str):
             return True, "cpu:i5-14600k", "i5-14600K", price, "< 1000"
         return False, "cpu:i5-14600k", "i5-14600K", price, ">= 1000 ou sem preço"
 
-    # GPUs - AJUSTADAS: removido 5050 e 7600, ajustado 5070 para 3700
+    # GPUs - AJUSTADAS: removido 5050 e 7600, ajustado limites
     if RTX5060_RE.search(t):
-        if price and price < 1900: return True, "gpu:rtx5060", "RTX 5060", price, "< 1900"
-        return False, "gpu:rtx5060", "RTX 5060", price, ">= 1900 ou sem preço"
+        if not price: return False, "gpu:rtx5060", "RTX 5060", None, "sem preço"
+        if price < 1900: return True, "gpu:rtx5060", "RTX 5060", price, "< 1900"
+        return False, "gpu:rtx5060", "RTX 5060", price, ">= 1900"
     
     if RTX5070_FAM.search(t):
-        if price and price < 3700: return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "< 3700"
-        return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">= 3700 ou sem preço"
+        if not price: return False, "gpu:rtx5070", "RTX 5070/5070 Ti", None, "sem preço"
+        if price < 3700: return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "< 3700"
+        return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">= 3700"
 
     # CPUs
     if AMD_BLOCK.search(t): return False, "cpu:amd:block", "CPU AMD inferior", price, "Ryzen 3/5 bloqueado"
@@ -342,6 +345,10 @@ def classify_and_match(text: str):
     if TENIS_NIKE_RE.search(t):
         if price and price < 250: return True, "tenis_nike", "Tênis Nike", price, "< 250"
         return False, "tenis_nike", "Tênis Nike", price, ">= 250 ou sem preço"
+
+    if WEBCAM_4K_RE.search(t):
+        if price and price < 250: return True, "webcam_4k", "Webcam 4K", price, "< 250"
+        return False, "webcam_4k", "Webcam 4K", price, ">= 250 ou sem preço"
 
     return False, "none", "sem match", price, "sem match"
 
