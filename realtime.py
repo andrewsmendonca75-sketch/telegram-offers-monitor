@@ -153,36 +153,60 @@ def notify_all(text: str):
             log.error("· envio=ERRO → %s | motivo=%s", d, msg)
 
 # ---------------------------------------------
-# PRICE PARSER (BRL)
+# PRICE PARSER (BRL) - Melhorado para evitar falsos positivos
 # ---------------------------------------------
 PRICE_RE = re.compile(
-    r"(?i)(r\$\s*)?("
-    r"(?:\d{1,3}(?:\.\d{3})+(?:,\d{2})?)"
-    r"|(?:\d{3,}(?:,\d{2})?)"
-    r"|(?:\d+,\d{2})"
-    r")"
+    r"(?i)(?:r\$|por|preço|valor|de|em)\s*(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)"
+)
+
+# Padrões a ignorar (cupons, moedas, etc)
+IGNORE_PRICE_CONTEXT = re.compile(
+    r"(?i)(cupom|desconto|off|cashback|moedas?|pontos?|parcelas?|frete|em\s+\d+x)", 
+    re.I
 )
 
 def _to_float_brl(raw: str) -> Optional[float]:
     s = raw.strip().replace(".", "").replace(",", ".")
     try:
         v = float(s)
-        return v if 0 < v < 1_000_000 else None
+        return v if 10 < v < 1_000_000 else None  # Preços realistas entre 10 e 1M
     except Exception:
         return None
 
 def find_lowest_price(text: str) -> Optional[float]:
+    """
+    Busca o menor preço válido no texto, ignorando:
+    - Valores de cupons
+    - Moedas/pontos
+    - Cashback
+    - Parcelas
+    """
     vals: List[float] = []
-    for m in PRICE_RE.finditer(text):
-        has_r = bool(m.group(1))
-        raw = m.group(2)
-        # avoid false matches like "2.5" without R$ if ambiguous
-        if "." in raw and "," not in raw and not has_r:
+    lines = text.split('\n')
+    
+    for line in lines:
+        # Ignora linhas com contexto de desconto/cupom
+        if IGNORE_PRICE_CONTEXT.search(line):
             continue
-        v = _to_float_brl(raw)
-        if not v or v < 5: continue
-        if v < 100 and not has_r: continue
-        vals.append(v)
+            
+        for m in PRICE_RE.finditer(line):
+            raw = m.group(1)
+            v = _to_float_brl(raw)
+            if v:
+                vals.append(v)
+    
+    # Se não encontrou com o padrão rigoroso, tenta padrão mais flexível
+    if not vals:
+        FALLBACK_RE = re.compile(r"(?i)r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)")
+        for line in lines:
+            if IGNORE_PRICE_CONTEXT.search(line):
+                continue
+            for m in FALLBACK_RE.finditer(line):
+                raw = m.group(1)
+                v = _to_float_brl(raw)
+                if v and v >= 100:  # Só aceita valores >= 100 no fallback
+                    vals.append(v)
+    
     return min(vals) if vals else None
 
 # ---------------------------------------------
@@ -273,34 +297,44 @@ def classify_and_match(text: str):
             return True, "cpu:i5-14600k", "i5-14600K", price, "< 1000"
         return False, "cpu:i5-14600k", "i5-14600K", price, ">= 1000 ou sem preço"
 
-    # GPUs - AJUSTADAS: removido 5050 e 7600, ajustado limites
+    # GPUs - AJUSTADAS: removido 5050 e 7600, validação de preço realista
     if RTX5060_RE.search(t):
         if not price: return False, "gpu:rtx5060", "RTX 5060", None, "sem preço"
+        if price < 1500: return False, "gpu:rtx5060", "RTX 5060", price, "preço irreal (< 1500)"
         if price < 1900: return True, "gpu:rtx5060", "RTX 5060", price, "< 1900"
         return False, "gpu:rtx5060", "RTX 5060", price, ">= 1900"
     
     if RTX5070_FAM.search(t):
         if not price: return False, "gpu:rtx5070", "RTX 5070/5070 Ti", None, "sem preço"
+        if price < 2500: return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "preço irreal (< 2500)"
         if price < 3700: return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "< 3700"
         return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">= 3700"
 
     # CPUs
     if AMD_BLOCK.search(t): return False, "cpu:amd:block", "CPU AMD inferior", price, "Ryzen 3/5 bloqueado"
     if INTEL_SUP.search(t):
-        if price and price < 900: return True, "cpu:intel", "CPU Intel sup.", price, "< 900"
-        return False, "cpu:intel", "CPU Intel sup.", price, ">= 900 ou sem preço"
+        if not price: return False, "cpu:intel", "CPU Intel sup.", None, "sem preço"
+        if price < 400: return False, "cpu:intel", "CPU Intel sup.", price, "preço irreal (< 400)"
+        if price < 900: return True, "cpu:intel", "CPU Intel sup.", price, "< 900"
+        return False, "cpu:intel", "CPU Intel sup.", price, ">= 900"
     if AMD_SUP.search(t):
-        if price and price < 900: return True, "cpu:amd", "CPU AMD sup.", price, "< 900"
-        return False, "cpu:amd", "CPU AMD sup.", price, ">= 900 ou sem preço"
+        if not price: return False, "cpu:amd", "CPU AMD sup.", None, "sem preço"
+        if price < 400: return False, "cpu:amd", "CPU AMD sup.", price, "preço irreal (< 400)"
+        if price < 900: return True, "cpu:amd", "CPU AMD sup.", price, "< 900"
+        return False, "cpu:amd", "CPU AMD sup.", price, ">= 900"
 
     # MOBOS
     if A520_RE.search(t): return False, "mobo:a520", "A520 bloqueada", price, "A520 bloqueada"
     if B550_FAM_RE.search(t):
-        if price and price < 550: return True, "mobo:am4", "B550/X570", price, "< 550"
-        return False, "mobo:am4", "B550/X570", price, ">= 550 ou sem preço"
+        if not price: return False, "mobo:am4", "B550/X570", None, "sem preço"
+        if price < 300: return False, "mobo:am4", "B550/X570", price, "preço irreal (< 300)"
+        if price < 550: return True, "mobo:am4", "B550/X570", price, "< 550"
+        return False, "mobo:am4", "B550/X570", price, ">= 550"
     if LGA1700_RE.search(t):
-        if price and price < 550: return True, "mobo:lga1700", "LGA1700", price, "< 550"
-        return False, "mobo:lga1700", "LGA1700", price, ">= 550 ou sem preço"
+        if not price: return False, "mobo:lga1700", "LGA1700", None, "sem preço"
+        if price < 300: return False, "mobo:lga1700", "LGA1700", price, "preço irreal (< 300)"
+        if price < 550: return True, "mobo:lga1700", "LGA1700", price, "< 550"
+        return False, "mobo:lga1700", "LGA1700", price, ">= 550"
 
     # GABINETE
     if GAB_RE.search(t):
