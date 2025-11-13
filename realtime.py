@@ -230,6 +230,8 @@ GB8_RE  = re.compile(r"\b8\s*gb\b", re.I)
 CADEIRA_RE = re.compile(r"\bcadeira\b", re.I)
 DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s*5)\b", re.I)
 WIFI_BT_RE = re.compile(r"\b(adaptador\s*wifi|adaptador\s*bluetooth|wifi\s*bluetooth|placa\s*wifi)\b", re.I)
+AR_CONDICIONADO_RE = re.compile(r"\b(ar\s*condicionado|split|inverter)\b", re.I)
+TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
 
 # ---------------------------------------------
 # HELPERS
@@ -332,6 +334,14 @@ def classify_and_match(text: str):
     if WIFI_BT_RE.search(t):
         if price and price < 250: return True, "wifi_bt", "Adaptador WiFi/Bluetooth", price, "< 250"
         return False, "wifi_bt", "Adaptador WiFi/Bluetooth", price, ">= 250 ou sem preço"
+
+    if AR_CONDICIONADO_RE.search(t):
+        if price and price < 1850: return True, "ar_condicionado", "Ar Condicionado", price, "< 1850"
+        return False, "ar_condicionado", "Ar Condicionado", price, ">= 1850 ou sem preço"
+
+    if TENIS_NIKE_RE.search(t):
+        if price and price < 250: return True, "tenis_nike", "Tênis Nike", price, "< 250"
+        return False, "tenis_nike", "Tênis Nike", price, ">= 250 ou sem preço"
 
     return False, "none", "sem match", price, "sem match"
 
