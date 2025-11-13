@@ -255,6 +255,13 @@ CADEIRA_RE = re.compile(r"\bcadeira\b", re.I)
 DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s*5)\b", re.I)
 WIFI_BT_RE = re.compile(r"\b(adaptador\s*wifi|adaptador\s*bluetooth|wifi\s*bluetooth|placa\s*wifi)\b", re.I)
 AR_CONDICIONADO_RE = re.compile(r"\b(ar\s*condicionado|split|inverter)\b", re.I)
+
+# Ar-condicionados PREMIUM específicos (com Oportunidade🔥)
+AR_PREMIUM_RE = re.compile(
+    r"\b(daikin\s+ecoswing|fujitsu\s+premium|samsung\s+windfree|elgin\s+eco\s+ii|gree\s+g[-\s]*top)\b",
+    re.I
+)
+
 TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
 WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
 
@@ -270,11 +277,18 @@ def count_fans(text: str) -> int:
     return n
 
 def needs_header(product_key: str, price: Optional[float]) -> bool:
-    """Define quando usar cabeçalho 'Corre!🔥'"""
+    """Define quando usar cabeçalho 'Corre!🔥' ou 'Oportunidade🔥'"""
     if not price: return False
     if product_key == "gpu:rtx5060" and price < 1900: return True
     if product_key.startswith("cpu:") and price < 900: return True
+    if product_key == "ar_premium" and price < 1850: return True  # Ar-condicionados premium
     return False
+
+def get_header_text(product_key: str) -> str:
+    """Retorna o texto correto do cabeçalho"""
+    if product_key == "ar_premium":
+        return "Oportunidade🔥 "
+    return "Corre!🔥 "
 
 # ---------------------------------------------
 # CORE MATCHER
@@ -361,8 +375,8 @@ def classify_and_match(text: str):
 
     # NOVAS CATEGORIAS
     if CADEIRA_RE.search(t):
-        if price and price < 400: return True, "cadeira", "Cadeira Gamer", price, "< 400"
-        return False, "cadeira", "Cadeira Gamer", price, ">= 400 ou sem preço"
+        if price and price < 500: return True, "cadeira", "Cadeira Gamer", price, "< 500"
+        return False, "cadeira", "Cadeira Gamer", price, ">= 500 ou sem preço"
 
     if DUALSENSE_RE.search(t):
         if price and price < 300: return True, "dualsense", "Controle PS5 DualSense", price, "< 300"
@@ -372,6 +386,14 @@ def classify_and_match(text: str):
         if price and price < 250: return True, "wifi_bt", "Adaptador WiFi/Bluetooth", price, "< 250"
         return False, "wifi_bt", "Adaptador WiFi/Bluetooth", price, ">= 250 ou sem preço"
 
+    # Ar-condicionados PREMIUM - verifica PRIMEIRO
+    if AR_PREMIUM_RE.search(t):
+        if not price: return False, "ar_premium", "Ar Condicionado Premium", None, "sem preço"
+        if price < 1000: return False, "ar_premium", "Ar Condicionado Premium", price, "preço irreal (< 1000)"
+        if price < 1850: return True, "ar_premium", "Ar Condicionado Premium", price, "< 1850"
+        return False, "ar_premium", "Ar Condicionado Premium", price, ">= 1850"
+
+    # Ar-condicionados GERAIS (outros modelos)
     if AR_CONDICIONADO_RE.search(t):
         if price and price < 1850: return True, "ar_condicionado", "Ar Condicionado", price, "< 1850"
         return False, "ar_condicionado", "Ar Condicionado", price, ">= 1850 ou sem preço"
@@ -518,7 +540,7 @@ def main():
                     price_disp = f"{price:.2f}" if isinstance(price, (int, float)) else "None"
 
                     if ok:
-                        header = "Corre!🔥 " if needs_header(key, price) else ""
+                        header = get_header_text(key) if needs_header(key, price) else ""
                         msg = f"{header}{msg_text}\n\n— via {chan_disp}"
                         log.info("[%-18s] MATCH → %s | price=%s | key=%s | reason=%s",
                                  chan_disp, title, price_disp, key, reason)
