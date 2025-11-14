@@ -153,15 +153,23 @@ def notify_all(text: str):
             log.error("· envio=ERRO → %s | motivo=%s", d, msg)
 
 # ---------------------------------------------
-# PRICE PARSER (BRL) - Melhorado para evitar falsos positivos
+# PRICE PARSER (BRL) - Versão Otimizada Final
 # ---------------------------------------------
-PRICE_RE = re.compile(
-    r"(?i)(?:r\$|por|preço|valor|de|em)\s*(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)"
+# Padrões principais de preço
+PRICE_MAIN_RE = re.compile(
+    r"(?i)(?:r\$|por|preço|valor|de)\s*r?\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)",
+    re.I
 )
 
-# Padrões a ignorar (cupons, moedas, etc)
+# Padrão fallback (qualquer R$ seguido de número)
+PRICE_FALLBACK_RE = re.compile(
+    r"(?i)r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)",
+    re.I
+)
+
+# Contextos a ignorar
 IGNORE_PRICE_CONTEXT = re.compile(
-    r"(?i)(cupom|desconto|off|cashback|moedas?|pontos?|parcelas?|frete|em\s+\d+x)", 
+    r"(?i)(cupom|desconto|off|cashback|moedas?|pontos?|em\s+\d+x|parcelas?|frete|resgate)",
     re.I
 )
 
@@ -169,43 +177,44 @@ def _to_float_brl(raw: str) -> Optional[float]:
     s = raw.strip().replace(".", "").replace(",", ".")
     try:
         v = float(s)
-        return v if 10 < v < 1_000_000 else None  # Preços realistas entre 10 e 1M
+        return v if 10 < v < 1_000_000 else None
     except Exception:
         return None
 
 def find_lowest_price(text: str) -> Optional[float]:
     """
-    Busca o menor preço válido no texto, ignorando:
-    - Valores de cupons
-    - Moedas/pontos
-    - Cashback
-    - Parcelas
+    Busca o menor preço válido no texto com múltiplas estratégias
     """
     vals: List[float] = []
     lines = text.split('\n')
     
+    # Estratégia 1: Busca com padrão principal (mais rigoroso)
     for line in lines:
-        # Ignora linhas com contexto de desconto/cupom
         if IGNORE_PRICE_CONTEXT.search(line):
             continue
-            
-        for m in PRICE_RE.finditer(line):
-            raw = m.group(1)
-            v = _to_float_brl(raw)
-            if v:
+        for m in PRICE_MAIN_RE.finditer(line):
+            v = _to_float_brl(m.group(1))
+            if v and v >= 50:  # Preços realistas mínimo 50
                 vals.append(v)
     
-    # Se não encontrou com o padrão rigoroso, tenta padrão mais flexível
+    # Estratégia 2: Se não achou, tenta fallback mais flexível
     if not vals:
-        FALLBACK_RE = re.compile(r"(?i)r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)")
         for line in lines:
+            # Pula linhas com contexto de cupom/desconto
             if IGNORE_PRICE_CONTEXT.search(line):
                 continue
-            for m in FALLBACK_RE.finditer(line):
-                raw = m.group(1)
-                v = _to_float_brl(raw)
-                if v and v >= 100:  # Só aceita valores >= 100 no fallback
+            for m in PRICE_FALLBACK_RE.finditer(line):
+                v = _to_float_brl(m.group(1))
+                if v and v >= 50:
                     vals.append(v)
+    
+    # Estratégia 3: Busca "à vista" ou "no pix" (mais preciso)
+    if not vals:
+        VISTA_RE = re.compile(r"(?i)r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:à vista|no pix)", re.I)
+        for m in VISTA_RE.finditer(text):
+            v = _to_float_brl(m.group(1))
+            if v:
+                vals.append(v)
     
     return min(vals) if vals else None
 
@@ -359,9 +368,17 @@ def classify_and_match(text: str):
         return False, "case", "Gabinete", price, "fora das regras"
 
     # COOLERS
-    if WATER_RE.search(t) and price and price <= 150: return True, "cooler:water", "Water Cooler", price, "<= 150"
-    if AIR_COOLER.search(t) and not WATER_RE.search(t) and price and price <= 150:
-        return True, "cooler:air", "Cooler (ar)", price, "<= 150"
+    if WATER_RE.search(t):
+        if not price: return False, "cooler:water", "Water Cooler", None, "sem preço"
+        if price < 50: return False, "cooler:water", "Water Cooler", price, "preço irreal (< 50)"
+        if price <= 150: return True, "cooler:water", "Water Cooler", price, "<= 150"
+        return False, "cooler:water", "Water Cooler", price, "> 150"
+    
+    if AIR_COOLER.search(t) and not WATER_RE.search(t):
+        if not price: return False, "cooler:air", "Cooler (ar)", None, "sem preço"
+        if price < 50: return False, "cooler:air", "Cooler (ar)", price, "preço irreal (< 50)"
+        if price <= 150: return True, "cooler:air", "Cooler (ar)", price, "<= 150"
+        return False, "cooler:air", "Cooler (ar)", price, "> 150"
 
     # SSD
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
@@ -379,8 +396,10 @@ def classify_and_match(text: str):
         return False, "cadeira", "Cadeira Gamer", price, ">= 500 ou sem preço"
 
     if DUALSENSE_RE.search(t):
-        if price and price < 300: return True, "dualsense", "Controle PS5 DualSense", price, "< 300"
-        return False, "dualsense", "Controle PS5 DualSense", price, ">= 300 ou sem preço"
+        if not price: return False, "dualsense", "Controle PS5 DualSense", None, "sem preço"
+        if price < 200: return False, "dualsense", "Controle PS5 DualSense", price, "preço irreal (< 200)"
+        if price < 300: return True, "dualsense", "Controle PS5 DualSense", price, "< 300"
+        return False, "dualsense", "Controle PS5 DualSense", price, ">= 300"
 
     if WIFI_BT_RE.search(t):
         if price and price < 250: return True, "wifi_bt", "Adaptador WiFi/Bluetooth", price, "< 250"
