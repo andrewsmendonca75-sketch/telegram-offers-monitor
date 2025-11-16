@@ -276,7 +276,7 @@ WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
 
 # Monitores
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
-MONITOR_SIZE_RE = re.compile(r"\b(24|27)\s*(pol|polegadas?|\")\b", re.I)
+MONITOR_SIZE_RE = re.compile(r"\b(24|27)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b", re.I)
 
 # ---------------------------------------------
 # HELPERS
