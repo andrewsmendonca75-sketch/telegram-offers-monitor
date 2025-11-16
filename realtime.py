@@ -235,8 +235,8 @@ AMD_BLOCK = re.compile(r"\b(ryzen\s*(?:3|5)|5600g?t?)\b", re.I)
 
 # Mobos
 A520_RE     = re.compile(r"\ba520m?\b", re.I)
-B550_FAM_RE = re.compile(r"\bb550m?\b|\bx570\b", re.I)
-LGA1700_RE  = re.compile(r"\b(h610m?|b660m?|b760m?|z690|z790)\b", re.I)
+H610_RE     = re.compile(r"\bh610m?\b", re.I)  # Bloqueada
+LGA1700_RE  = re.compile(r"\b(b660m?|b760m?|z690|z790)\b", re.I)  # Removido H610
 
 SPECIFIC_B760M_RE = re.compile(r"\bb760m\b", re.I)
 INTEL_14600K_RE   = re.compile(r"\bi5[-\s]*14600k\b", re.I)
@@ -273,6 +273,10 @@ AR_PREMIUM_RE = re.compile(
 
 TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
 WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
+
+# Monitores
+MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
+MONITOR_SIZE_RE = re.compile(r"\b(24|27)\s*(pol|polegadas?|\")\b", re.I)
 
 # ---------------------------------------------
 # HELPERS
@@ -346,17 +350,14 @@ def classify_and_match(text: str):
         if price < 900: return True, "cpu:amd", "CPU AMD sup.", price, "< 900"
         return False, "cpu:amd", "CPU AMD sup.", price, ">= 900"
 
-    # MOBOS
+    # MOBOS - REMOVIDO AMD (B550/X570), BLOQUEADO H610
     if A520_RE.search(t): return False, "mobo:a520", "A520 bloqueada", price, "A520 bloqueada"
-    if B550_FAM_RE.search(t):
-        if not price: return False, "mobo:am4", "B550/X570", None, "sem preço"
-        if price < 300: return False, "mobo:am4", "B550/X570", price, "preço irreal (< 300)"
-        if price < 550: return True, "mobo:am4", "B550/X570", price, "< 550"
-        return False, "mobo:am4", "B550/X570", price, ">= 550"
+    if H610_RE.search(t): return False, "mobo:h610", "H610 bloqueada", price, "H610 bloqueada"
+    
     if LGA1700_RE.search(t):
         if not price: return False, "mobo:lga1700", "LGA1700", None, "sem preço"
         if price < 300: return False, "mobo:lga1700", "LGA1700", price, "preço irreal (< 300)"
-        if price < 550: return True, "mobo:lga1700", "LGA1700", price, "< 550"
+        if price < 550: return True, "mobo:lga1700", "LGA1700 (B660/B760/Z690/Z790)", price, "< 550"
         return False, "mobo:lga1700", "LGA1700", price, ">= 550"
 
     # GABINETE
@@ -424,6 +425,13 @@ def classify_and_match(text: str):
     if WEBCAM_4K_RE.search(t):
         if price and price < 250: return True, "webcam_4k", "Webcam 4K", price, "< 250"
         return False, "webcam_4k", "Webcam 4K", price, ">= 250 ou sem preço"
+
+    # MONITORES 24" ou 27"
+    if MONITOR_RE.search(t) and MONITOR_SIZE_RE.search(t):
+        if not price: return False, "monitor", "Monitor 24/27\"", None, "sem preço"
+        if price < 200: return False, "monitor", "Monitor 24/27\"", price, "preço irreal (< 200)"
+        if price <= 650: return True, "monitor", "Monitor 24/27\"", price, "<= 650"
+        return False, "monitor", "Monitor 24/27\"", price, "> 650"
 
     return False, "none", "sem match", price, "sem match"
 
