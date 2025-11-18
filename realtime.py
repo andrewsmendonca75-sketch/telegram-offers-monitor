@@ -221,7 +221,7 @@ def find_lowest_price(text: str) -> Optional[float]:
 # ---------------------------------------------
 # REGEX RULES
 # ---------------------------------------------
-BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook)\b", re.I)
+BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook|geladeira|refrigerador|smart\s*tv|televisão|televisao|tv\s+\d+)\b", re.I)
 PC_GAMER_RE = re.compile(r"\b(pc\s*gamer|setup\s*completo|kit\s*completo)\b", re.I)
 
 # GPUs - REMOVIDAS: RTX 5050 e RX 7600
@@ -229,9 +229,9 @@ RTX5060_RE   = re.compile(r"\brtx\s*5060(?!\s*ti)\b", re.I)
 RTX5070_FAM  = re.compile(r"\brtx\s*5070(\s*ti)?\b", re.I)
 
 # CPUs
-INTEL_SUP = re.compile(r"\b(i(?:5|7|9)[-\s]*(?:12|13|14)\d{2,3}k?f?)\b", re.I)
-AMD_SUP   = re.compile(r"\b(ryzen\s*(?:7\s*5700x?|7\s*5800x3?d?|9\s*5900x|9\s*5950x))\b", re.I)
-AMD_BLOCK = re.compile(r"\b(ryzen\s*(?:3|5)|5600g?t?)\b", re.I)
+INTEL_SUP = re.compile(r"\b(i5[-\s]*14[4-9]\d{2}[kf]*|i5[-\s]*145\d{2}[kf]*|i7[-\s]*14\d{3}[kf]*|i9[-\s]*14\d{3}[kf]*)\b", re.I)
+AMD_SUP   = re.compile(r"\b(ryzen\s*7\s*5700x[3d]*|ryzen\s*7\s*5800x[3d]*|ryzen\s*9\s*5900x|ryzen\s*9\s*5950x)\b", re.I)
+AMD_BLOCK = re.compile(r"\b(ryzen\s*(?:3|5)\s|5600g?t?|5500|5700(?!x))\b", re.I)
 
 # Mobos
 A520_RE     = re.compile(r"\ba520m?\b", re.I)
@@ -241,16 +241,14 @@ LGA1700_RE  = re.compile(r"\b(b660m?|b760m?|z690|z790)\b", re.I)  # Removido H61
 SPECIFIC_B760M_RE = re.compile(r"\bb760m\b", re.I)
 INTEL_14600K_RE   = re.compile(r"\bi5[-\s]*14600k\b", re.I)
 
-# Gabinete
+# Gabinete - Sem restrição de fans
 GAB_RE     = re.compile(r"\bgabinete\b", re.I)
-FANS_HINT  = re.compile(r"(?:(\d+)\s*(?:fans?|coolers?|ventoinhas?)|(\d+)\s*x\s*120\s*mm|(\d+)\s*x\s*fan)", re.I)
 
-# Coolers
-WATER_RE   = re.compile(r"\bwater\s*cooler\b", re.I)
-AIR_COOLER = re.compile(r"\bcooler\b", re.I)
+# Coolers - APENAS Water Cooler 240mm
+WATER_240MM_RE = re.compile(r"\bwater\s*cooler\b.*\b240\s*mm\b|\b240\s*mm\b.*\bwater\s*cooler\b", re.I)
 
-# SSD
-SSD_RE  = re.compile(r"\bssd\b", re.I)
+# SSD - APENAS Kingston
+SSD_RE  = re.compile(r"\bssd\b.*\bkingston\b|\bkingston\b.*\bssd\b", re.I)
 M2_RE   = re.compile(r"\bm\.?2\b|\bnvme\b", re.I)
 TB1_RE  = re.compile(r"\b1\s*tb\b", re.I)
 
@@ -274,21 +272,13 @@ AR_PREMIUM_RE = re.compile(
 TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
 WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
 
-# Monitores
+# Monitores - APENAS 27" ou maior
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
-MONITOR_SIZE_RE = re.compile(r"\b(24|27)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b", re.I)
+MONITOR_SIZE_RE = re.compile(r"\b(27|28|29|30|31|32|34|35|38|40|42|43|45|48|49|50|55)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b", re.I)
 
 # ---------------------------------------------
 # HELPERS
 # ---------------------------------------------
-def count_fans(text: str) -> int:
-    n = 0
-    for m in FANS_HINT.finditer(text):
-        for g in m.groups():
-            if g and g.isdigit():
-                n = max(n, int(g))
-    return n
-
 def needs_header(product_key: str, price: Optional[float]) -> bool:
     """Define quando usar cabeçalho 'Corre!🔥' ou 'Oportunidade🔥'"""
     if not price: return False
@@ -337,17 +327,17 @@ def classify_and_match(text: str):
         if price < 3700: return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "< 3700"
         return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">= 3700"
 
-    # CPUs
+    # CPUs - REFORÇADO: i5-14400F ou superior, Ryzen 7 5700X ou superior
     if AMD_BLOCK.search(t): return False, "cpu:amd:block", "CPU AMD inferior", price, "Ryzen 3/5 bloqueado"
     if INTEL_SUP.search(t):
         if not price: return False, "cpu:intel", "CPU Intel sup.", None, "sem preço"
         if price < 400: return False, "cpu:intel", "CPU Intel sup.", price, "preço irreal (< 400)"
-        if price < 900: return True, "cpu:intel", "CPU Intel sup.", price, "< 900"
+        if price < 900: return True, "cpu:intel", "CPU Intel sup. (i5-14400F+)", price, "< 900"
         return False, "cpu:intel", "CPU Intel sup.", price, ">= 900"
     if AMD_SUP.search(t):
         if not price: return False, "cpu:amd", "CPU AMD sup.", None, "sem preço"
         if price < 400: return False, "cpu:amd", "CPU AMD sup.", price, "preço irreal (< 400)"
-        if price < 900: return True, "cpu:amd", "CPU AMD sup.", price, "< 900"
+        if price < 900: return True, "cpu:amd", "CPU AMD sup. (Ryzen 7 5700X+)", price, "< 900"
         return False, "cpu:amd", "CPU AMD sup.", price, ">= 900"
 
     # MOBOS - REMOVIDO AMD (B550/X570), BLOQUEADO H610
@@ -360,31 +350,24 @@ def classify_and_match(text: str):
         if price < 550: return True, "mobo:lga1700", "LGA1700 (B660/B760/Z690/Z790)", price, "< 550"
         return False, "mobo:lga1700", "LGA1700", price, ">= 550"
 
-    # GABINETE
+    # GABINETE - Apenas abaixo de 120, sem restrição de fans
     if GAB_RE.search(t):
-        fans = count_fans(t)
-        if not price: return False, "case", "Gabinete", price, "sem preço"
-        if (fans == 3 and price <= 160) or (fans >= 4 and price <= 220):
-            return True, "case", "Gabinete", price, f"{fans} fans ok"
-        return False, "case", "Gabinete", price, "fora das regras"
+        if not price: return False, "case", "Gabinete", None, "sem preço"
+        if price < 120: return True, "case", "Gabinete", price, "< 120"
+        return False, "case", "Gabinete", price, ">= 120"
 
-    # COOLERS
-    if WATER_RE.search(t):
-        if not price: return False, "cooler:water", "Water Cooler", None, "sem preço"
-        if price < 50: return False, "cooler:water", "Water Cooler", price, "preço irreal (< 50)"
-        if price <= 150: return True, "cooler:water", "Water Cooler", price, "<= 150"
-        return False, "cooler:water", "Water Cooler", price, "> 150"
-    
-    if AIR_COOLER.search(t) and not WATER_RE.search(t):
-        if not price: return False, "cooler:air", "Cooler (ar)", None, "sem preço"
-        if price < 50: return False, "cooler:air", "Cooler (ar)", price, "preço irreal (< 50)"
-        if price <= 150: return True, "cooler:air", "Cooler (ar)", price, "<= 150"
-        return False, "cooler:air", "Cooler (ar)", price, "> 150"
+    # WATER COOLER - APENAS 240mm abaixo de 200
+    if WATER_240MM_RE.search(t):
+        if not price: return False, "cooler:water240", "Water Cooler 240mm", None, "sem preço"
+        if price < 50: return False, "cooler:water240", "Water Cooler 240mm", price, "preço irreal (< 50)"
+        if price < 200: return True, "cooler:water240", "Water Cooler 240mm", price, "< 200"
+        return False, "cooler:water240", "Water Cooler 240mm", price, ">= 200"
 
-    # SSD
+    # SSD - APENAS Kingston M.2 1TB
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
-        if price and price <= 460: return True, "ssd:m2:1tb", "SSD M.2 1TB", price, "<= 460"
-        return False, "ssd:m2:1tb", "SSD M.2 1TB", price, "> 460 ou sem preço"
+        if not price: return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", None, "sem preço"
+        if price <= 460: return True, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "<= 460"
+        return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "> 460"
 
     # RAM
     if RAM_RE.search(t):
@@ -426,12 +409,12 @@ def classify_and_match(text: str):
         if price and price < 250: return True, "webcam_4k", "Webcam 4K", price, "< 250"
         return False, "webcam_4k", "Webcam 4K", price, ">= 250 ou sem preço"
 
-    # MONITORES 24" ou 27"
+    # MONITORES - APENAS 27" ou maior, até 700 reais
     if MONITOR_RE.search(t) and MONITOR_SIZE_RE.search(t):
-        if not price: return False, "monitor", "Monitor 24/27\"", None, "sem preço"
-        if price < 200: return False, "monitor", "Monitor 24/27\"", price, "preço irreal (< 200)"
-        if price <= 650: return True, "monitor", "Monitor 24/27\"", price, "<= 650"
-        return False, "monitor", "Monitor 24/27\"", price, "> 650"
+        if not price: return False, "monitor", "Monitor 27\"+", None, "sem preço"
+        if price < 200: return False, "monitor", "Monitor 27\"+", price, "preço irreal (< 200)"
+        if price < 700: return True, "monitor", "Monitor 27\"+", price, "< 700"
+        return False, "monitor", "Monitor 27\"+", price, ">= 700"
 
     return False, "none", "sem match", price, "sem match"
 
