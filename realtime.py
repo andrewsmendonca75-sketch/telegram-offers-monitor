@@ -153,23 +153,29 @@ def notify_all(text: str):
             log.error("· envio=ERRO → %s | motivo=%s", d, msg)
 
 # ---------------------------------------------
-# PRICE PARSER (BRL) - Versão Otimizada Final
+# PRICE PARSER (BRL) - Versão Ultra Otimizada
 # ---------------------------------------------
-# Padrões principais de preço
+# Padrão principal: captura preços em vários contextos
 PRICE_MAIN_RE = re.compile(
-    r"(?i)(?:r\$|por|preço|valor|de)\s*r?\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)",
+    r"(?i)(?:r\$|por|preço|valor|price)\s*r?\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)",
     re.I
 )
 
-# Padrão fallback (qualquer R$ seguido de número)
+# Padrão "no pix" / "à vista" (mais confiável)
+PRICE_PIX_RE = re.compile(
+    r"(?i)r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:no\s*pix|à\s*vista|a\s*vista)",
+    re.I
+)
+
+# Fallback: qualquer R$ seguido de valor
 PRICE_FALLBACK_RE = re.compile(
     r"(?i)r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{3,}(?:,\d{2})?)",
     re.I
 )
 
-# Contextos a ignorar
-IGNORE_PRICE_CONTEXT = re.compile(
-    r"(?i)(cupom|desconto|off|cashback|moedas?|pontos?|em\s+\d+x|parcelas?|frete|resgate)",
+# Palavras que indicam que o número NÃO é um preço de produto
+NOT_PRICE_WORDS = re.compile(
+    r"(?i)\b(moedas?|pontos?|cashback|reembolso|de\s*volta|parcelas?|x\s*de|frete)\b",
     re.I
 )
 
@@ -183,37 +189,47 @@ def _to_float_brl(raw: str) -> Optional[float]:
 
 def find_lowest_price(text: str) -> Optional[float]:
     """
-    Busca o menor preço válido no texto com múltiplas estratégias
+    Busca o menor preço válido no texto com múltiplas estratégias.
+    Agora mais cirúrgico: analisa palavra por palavra, não linha por linha.
     """
     vals: List[float] = []
-    lines = text.split('\n')
     
-    # Estratégia 1: Busca com padrão principal (mais rigoroso)
-    for line in lines:
-        if IGNORE_PRICE_CONTEXT.search(line):
-            continue
-        for m in PRICE_MAIN_RE.finditer(line):
+    # Estratégia 1: "no pix" / "à vista" (mais confiável)
+    for m in PRICE_PIX_RE.finditer(text):
+        v = _to_float_brl(m.group(1))
+        if v and v >= 50:
+            vals.append(v)
+    
+    # Estratégia 2: Padrão principal
+    if not vals:
+        for m in PRICE_MAIN_RE.finditer(text):
+            # Pega contexto ao redor (20 chars antes e depois)
+            start = max(0, m.start() - 20)
+            end = min(len(text), m.end() + 20)
+            context = text[start:end]
+            
+            # Se o contexto tem palavras de "não é preço", pula
+            if NOT_PRICE_WORDS.search(context):
+                continue
+                
             v = _to_float_brl(m.group(1))
-            if v and v >= 50:  # Preços realistas mínimo 50
+            if v and v >= 50:
                 vals.append(v)
     
-    # Estratégia 2: Se não achou, tenta fallback mais flexível
+    # Estratégia 3: Fallback (procura qualquer R$)
     if not vals:
-        for line in lines:
-            # Pula linhas com contexto de cupom/desconto
-            if IGNORE_PRICE_CONTEXT.search(line):
+        for m in PRICE_FALLBACK_RE.finditer(text):
+            # Pega contexto ao redor
+            start = max(0, m.start() - 20)
+            end = min(len(text), m.end() + 20)
+            context = text[start:end]
+            
+            # Se tem palavras de "não é preço", pula
+            if NOT_PRICE_WORDS.search(context):
                 continue
-            for m in PRICE_FALLBACK_RE.finditer(line):
-                v = _to_float_brl(m.group(1))
-                if v and v >= 50:
-                    vals.append(v)
-    
-    # Estratégia 3: Busca "à vista" ou "no pix" (mais preciso)
-    if not vals:
-        VISTA_RE = re.compile(r"(?i)r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:à vista|no pix)", re.I)
-        for m in VISTA_RE.finditer(text):
+            
             v = _to_float_brl(m.group(1))
-            if v:
+            if v and v >= 50:
                 vals.append(v)
     
     return min(vals) if vals else None
