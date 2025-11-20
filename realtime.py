@@ -2,11 +2,16 @@
 """
 Realtime Telegram monitor (Telethon) - versão ajustada
 
-(Mesmas notas de antes; alterações recentes:
-- removido adaptador wifi/bt
-- removida regra genérica de RAM; mantida apenas Geil Orion específica
-- DualSense agora usa cabeçalho Corre!🔥 quando < R$ 300
-)
+Melhorias incluídas:
+- validação de ENV no startup (evita falha silenciosa)
+- logs mais detalhados e consistentes
+- proteção DUP melhorada (chat_id + message_id) com persistência em arquivo
+- retries e backoff no envio via Bot API (requests)
+- captura de exceções dentro do handler (não deixa o bot morrer)
+- dump periódico / on-exit do seen cache e do histórico de matches para .log (para arquivar)
+- gravação de um arquivo 'health' com timestamp para monitoramento externo
+- limitações em env vars e parsing defensivo de mensagens
+- mantém compatibilidade com Telethon StringSession
 """
 
 import os
@@ -263,13 +268,20 @@ SSD_RE  = re.compile(r"\bssd\b.*\bkingston\b|\bkingston\b.*\bssd\b", re.I)
 M2_RE   = re.compile(r"\bm\.?2\b|\bnvme\b", re.I)
 TB1_RE  = re.compile(r"\b1\s*tb\b", re.I)
 
-# REMOVIDO: detecção genérica de RAM (mantida apenas Geil Orion específica abaixo)
-GEIL_ORION_RE = re.compile(r"\b(geil\s*orion|gaog416gb3200c22sc|gaog4?16gb3200c22sc)\b", re.I)
+# RAM
+RAM_RE  = re.compile(r"\bddr4\b", re.I)
+GB16_RE = re.compile(r"\b16\s*gb\b", re.I)
+GB8_RE  = re.compile(r"\b8\s*gb\b", re.I)
+GB8_RE  = re.compile(r"\b8\s*gb\b", re.I)
 
 # NOVAS CATEGORIAS
 CADEIRA_RE = re.compile(r"\bcadeira\b", re.I)
-# DualSense mantido, mas agora ganha cabeçalho 'Corre!🔥' quando abaixo do limite
+
+# DualSense - agora com "Corre!🔥"
 DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s*5)\b", re.I)
+
+# RAM - APENAS Geil Orion específica
+RAM_GEIL_ORION_RE = re.compile(r"\bgeil\s*orion\b.*\b16\s*gb\b|\b16\s*gb\b.*\bgeil\s*orion\b", re.I)
 
 AR_CONDICIONADO_RE = re.compile(r"\b(ar\s*condicionado|split|inverter)\b", re.I)
 
@@ -282,9 +294,18 @@ AR_PREMIUM_RE = re.compile(
 TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
 WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
 
-# Monitores - APENAS 27" ou maior
+# Mala de bordo
+MALA_BORDO_RE = re.compile(r"\bmala\b.*\bbordo\b|\bbordo\b.*\bmala\b", re.I)
+
+# Monitores
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
+
+# Monitor LG UltraGear 24" específico (com Corre!🔥)
+MONITOR_LG_24_RE = re.compile(r"\blg\s*ultragear\b.*\b24\s*[\"\'']?.*\b180\s*hz\b", re.I)
+
+# Monitores 27" ou maior - APENAS 144Hz+
 MONITOR_SIZE_RE = re.compile(r"\b(27|28|29|30|31|32|34|35|38|40|42|43|45|48|49|50|55)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b", re.I)
+MONITOR_144HZ_RE = re.compile(r"\b(14[4-9]|1[5-9]\d|[2-9]\d{2})\s*hz\b", re.I)
 
 # ---------------------------------------------
 # HELPERS
@@ -294,8 +315,9 @@ def needs_header(product_key: str, price: Optional[float]) -> bool:
     if not price: return False
     if product_key == "gpu:rtx5060" and price < 1900: return True
     if product_key.startswith("cpu:") and price < 900: return True
-    if product_key == "ar_premium" and price < 1850: return True  # Ar-condicionados premium usam Oportunidade🔥 but treated as header
-    if product_key == "dualsense" and price < 300: return True  # DualSense agora usa Corre!🔥
+    if product_key == "ar_premium" and price < 1850: return True
+    if product_key == "dualsense" and price < 300: return True  # DualSense com Corre!🔥
+    if product_key == "monitor:lg24" and price < 700: return True  # LG UltraGear 24" com Corre!🔥
     return False
 
 def get_header_text(product_key: str) -> str:
@@ -380,19 +402,18 @@ def classify_and_match(text: str):
         if price <= 460: return True, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "<= 460"
         return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "> 460"
 
-    # REMOVIDO: regra genérica de RAM
-    # Mantida apenas a Geil Orion específica
-    if GEIL_ORION_RE.search(t):
-        if not price: return False, "ram:geilorion", "Memoria DDR4 Geil Orion 16GB 3200 (GAOG416GB3200C22SC)", None, "sem preço"
-        if price <= 300: return True, "ram:geilorion", "Memoria DDR4 Geil Orion 16GB 3200 (GAOG416GB3200C22SC)", price, "<= 300"
-        return False, "ram:geilorion", "Memoria DDR4 Geil Orion 16GB 3200 (GAOG416GB3200C22SC)", price, "> 300"
+    # RAM - APENAS Geil Orion 16GB
+    if RAM_GEIL_ORION_RE.search(t):
+        if not price: return False, "ram:geil_orion", "Memória Geil Orion 16GB", None, "sem preço"
+        if price <= 300: return True, "ram:geil_orion", "Memória Geil Orion 16GB DDR4 3200MHz", price, "<= 300"
+        return False, "ram:geil_orion", "Memória Geil Orion 16GB", price, "> 300"
 
     # NOVAS CATEGORIAS
     if CADEIRA_RE.search(t):
         if price and price < 500: return True, "cadeira", "Cadeira Gamer", price, "< 500"
         return False, "cadeira", "Cadeira Gamer", price, ">= 500 ou sem preço"
 
-    # DualSense mantido como categoria, agora com cabeçalho Corre!🔥 quando < 300
+    # DualSense - AGORA COM "Corre!🔥"
     if DUALSENSE_RE.search(t):
         if not price: return False, "dualsense", "Controle PS5 DualSense", None, "sem preço"
         if price < 200: return False, "dualsense", "Controle PS5 DualSense", price, "preço irreal (< 200)"
@@ -419,12 +440,26 @@ def classify_and_match(text: str):
         if price and price < 250: return True, "webcam_4k", "Webcam 4K", price, "< 250"
         return False, "webcam_4k", "Webcam 4K", price, ">= 250 ou sem preço"
 
-    # MONITORES - APENAS 27" ou maior, até 700 reais
-    if MONITOR_RE.search(t) and MONITOR_SIZE_RE.search(t):
-        if not price: return False, "monitor", "Monitor 27\"+", None, "sem preço"
-        if price < 200: return False, "monitor", "Monitor 27\"+", price, "preço irreal (< 200)"
-        if price < 700: return True, "monitor", "Monitor 27\"+", price, "< 700"
-        return False, "monitor", "Monitor 27\"+", price, ">= 700"
+    # MALA DE BORDO
+    if MALA_BORDO_RE.search(t):
+        if not price: return False, "mala_bordo", "Mala de Bordo", None, "sem preço"
+        if price < 50: return False, "mala_bordo", "Mala de Bordo", price, "preço irreal (< 50)"
+        if price < 125: return True, "mala_bordo", "Mala de Bordo", price, "< 125"
+        return False, "mala_bordo", "Mala de Bordo", price, ">= 125"
+
+    # MONITOR LG UltraGear 24" 180Hz - ESPECÍFICO COM "Corre!🔥"
+    if MONITOR_LG_24_RE.search(t):
+        if not price: return False, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", None, "sem preço"
+        if price < 200: return False, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", price, "preço irreal (< 200)"
+        if price < 700: return True, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", price, "< 700"
+        return False, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", price, ">= 700"
+
+    # MONITORES - 27"+ APENAS com 144Hz ou superior
+    if MONITOR_RE.search(t) and MONITOR_SIZE_RE.search(t) and MONITOR_144HZ_RE.search(t):
+        if not price: return False, "monitor", "Monitor 27\"+ 144Hz+", None, "sem preço"
+        if price < 200: return False, "monitor", "Monitor 27\"+ 144Hz+", price, "preço irreal (< 200)"
+        if price < 700: return True, "monitor", "Monitor 27\"+ 144Hz+", price, "< 700"
+        return False, "monitor", "Monitor 27\"+ 144Hz+", price, ">= 700"
 
     return False, "none", "sem match", price, "sem match"
 
