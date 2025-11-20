@@ -2,16 +2,11 @@
 """
 Realtime Telegram monitor (Telethon) - versão ajustada
 
-Melhorias incluídas:
-- validação de ENV no startup (evita falha silenciosa)
-- logs mais detalhados e consistentes
-- proteção DUP melhorada (chat_id + message_id) com persistência em arquivo
-- retries e backoff no envio via Bot API (requests)
-- captura de exceções dentro do handler (não deixa o bot morrer)
-- dump periódico / on-exit do seen cache e do histórico de matches para .log (para arquivar)
-- gravação de um arquivo 'health' com timestamp para monitoramento externo
-- limitações em env vars e parsing defensivo de mensagens
-- mantém compatibilidade com Telethon StringSession
+(Mesmas notas de antes; alterações recentes:
+- removido adaptador wifi/bt
+- removida regra genérica de RAM; mantida apenas Geil Orion específica
+- DualSense agora usa cabeçalho Corre!🔥 quando < R$ 300
+)
 """
 
 import os
@@ -268,15 +263,14 @@ SSD_RE  = re.compile(r"\bssd\b.*\bkingston\b|\bkingston\b.*\bssd\b", re.I)
 M2_RE   = re.compile(r"\bm\.?2\b|\bnvme\b", re.I)
 TB1_RE  = re.compile(r"\b1\s*tb\b", re.I)
 
-# RAM
-RAM_RE  = re.compile(r"\bddr4\b", re.I)
-GB16_RE = re.compile(r"\b16\s*gb\b", re.I)
-GB8_RE  = re.compile(r"\b8\s*gb\b", re.I)
+# REMOVIDO: detecção genérica de RAM (mantida apenas Geil Orion específica abaixo)
+GEIL_ORION_RE = re.compile(r"\b(geil\s*orion|gaog416gb3200c22sc|gaog4?16gb3200c22sc)\b", re.I)
 
 # NOVAS CATEGORIAS
 CADEIRA_RE = re.compile(r"\bcadeira\b", re.I)
+# DualSense mantido, mas agora ganha cabeçalho 'Corre!🔥' quando abaixo do limite
 DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s*5)\b", re.I)
-WIFI_BT_RE = re.compile(r"\b(adaptador\s*wifi|adaptador\s*bluetooth|wifi\s*bluetooth|placa\s*wifi)\b", re.I)
+
 AR_CONDICIONADO_RE = re.compile(r"\b(ar\s*condicionado|split|inverter)\b", re.I)
 
 # Ar-condicionados PREMIUM específicos (com Oportunidade🔥)
@@ -300,7 +294,8 @@ def needs_header(product_key: str, price: Optional[float]) -> bool:
     if not price: return False
     if product_key == "gpu:rtx5060" and price < 1900: return True
     if product_key.startswith("cpu:") and price < 900: return True
-    if product_key == "ar_premium" and price < 1850: return True  # Ar-condicionados premium
+    if product_key == "ar_premium" and price < 1850: return True  # Ar-condicionados premium usam Oportunidade🔥 but treated as header
+    if product_key == "dualsense" and price < 300: return True  # DualSense agora usa Corre!🔥
     return False
 
 def get_header_text(product_key: str) -> str:
@@ -385,25 +380,24 @@ def classify_and_match(text: str):
         if price <= 460: return True, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "<= 460"
         return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "> 460"
 
-    # RAM
-    if RAM_RE.search(t):
-        if GB16_RE.search(t) and price and price <= 300: return True, "ram:16", "DDR4 16GB", price, "<= 300"
-        if GB8_RE.search(t) and price and price <= 150: return True, "ram:8", "DDR4 8GB", price, "<= 150"
+    # REMOVIDO: regra genérica de RAM
+    # Mantida apenas a Geil Orion específica
+    if GEIL_ORION_RE.search(t):
+        if not price: return False, "ram:geilorion", "Memoria DDR4 Geil Orion 16GB 3200 (GAOG416GB3200C22SC)", None, "sem preço"
+        if price <= 300: return True, "ram:geilorion", "Memoria DDR4 Geil Orion 16GB 3200 (GAOG416GB3200C22SC)", price, "<= 300"
+        return False, "ram:geilorion", "Memoria DDR4 Geil Orion 16GB 3200 (GAOG416GB3200C22SC)", price, "> 300"
 
     # NOVAS CATEGORIAS
     if CADEIRA_RE.search(t):
         if price and price < 500: return True, "cadeira", "Cadeira Gamer", price, "< 500"
         return False, "cadeira", "Cadeira Gamer", price, ">= 500 ou sem preço"
 
+    # DualSense mantido como categoria, agora com cabeçalho Corre!🔥 quando < 300
     if DUALSENSE_RE.search(t):
         if not price: return False, "dualsense", "Controle PS5 DualSense", None, "sem preço"
         if price < 200: return False, "dualsense", "Controle PS5 DualSense", price, "preço irreal (< 200)"
         if price < 300: return True, "dualsense", "Controle PS5 DualSense", price, "< 300"
         return False, "dualsense", "Controle PS5 DualSense", price, ">= 300"
-
-    if WIFI_BT_RE.search(t):
-        if price and price < 250: return True, "wifi_bt", "Adaptador WiFi/Bluetooth", price, "< 250"
-        return False, "wifi_bt", "Adaptador WiFi/Bluetooth", price, ">= 250 ou sem preço"
 
     # Ar-condicionados PREMIUM - verifica PRIMEIRO
     if AR_PREMIUM_RE.search(t):
