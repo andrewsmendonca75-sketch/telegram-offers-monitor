@@ -237,7 +237,7 @@ def find_lowest_price(text: str) -> Optional[float]:
 # ---------------------------------------------
 # REGEX RULES
 # ---------------------------------------------
-BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook|geladeira|refrigerador|smart\s*tv|televisão|televisao|tv\s+\d+)\b", re.I)
+BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook|geladeira|refrigerador|smart\s*tv|televisão|televisao|tv\s+\d+|m[aá]quina\s*de\s*lavar|lavadora|lava\s*e\s*seca)\b", re.I)
 PC_GAMER_RE = re.compile(r"\b(pc\s*gamer|setup\s*completo|kit\s*completo)\b", re.I)
 
 # GPUs - REMOVIDAS: RTX 5050 e RX 7600
@@ -300,8 +300,13 @@ MALA_BORDO_RE = re.compile(r"\bmala\b.*\bbordo\b|\bbordo\b.*\bmala\b", re.I)
 # Monitores
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
 
-# Monitor LG UltraGear 24" específico (com Corre!🔥)
-MONITOR_LG_24_RE = re.compile(r"\blg\s*ultragear\b.*\b24\s*[\"\'']?.*\b180\s*hz\b", re.I)
+# Monitor LG UltraGear 27" específico (com Corre!🔥) - MUITO ESPECÍFICO
+MONITOR_LG_27_RE = re.compile(
+    r"\blg\s*ultragear\b.*\b27\s*[\"\'']?.*\b180\s*hz\b|"
+    r"\b27gs60f\b|"
+    r"\blg\b.*\b27\s*[\"\'']?.*\bultragear\b.*\b180\s*hz\b",
+    re.I
+)
 
 # Monitores 27" ou maior - APENAS 144Hz+
 MONITOR_SIZE_RE = re.compile(r"\b(27|28|29|30|31|32|34|35|38|40|42|43|45|48|49|50|55)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b", re.I)
@@ -317,7 +322,7 @@ def needs_header(product_key: str, price: Optional[float]) -> bool:
     if product_key.startswith("cpu:") and price < 900: return True
     if product_key == "ar_premium" and price < 1850: return True
     if product_key == "dualsense" and price < 300: return True  # DualSense com Corre!🔥
-    if product_key == "monitor:lg24" and price < 700: return True  # LG UltraGear 24" com Corre!🔥
+    if product_key == "monitor:lg27" and price < 700: return True  # LG UltraGear 27" com Corre!🔥
     return False
 
 def get_header_text(product_key: str) -> str:
@@ -343,9 +348,10 @@ def classify_and_match(text: str):
         return False, "mobo:b760m", "B760M", price, ">= 1000 ou sem preço"
 
     if INTEL_14600K_RE.search(t):
-        if price and price < 1000:
-            return True, "cpu:i5-14600k", "i5-14600K", price, "< 1000"
-        return False, "cpu:i5-14600k", "i5-14600K", price, ">= 1000 ou sem preço"
+        if not price: return False, "cpu:i5-14600k", "i5-14600K", None, "sem preço"
+        if price < 400: return False, "cpu:i5-14600k", "i5-14600K", price, "preço irreal (< 400)"
+        if price < 1000: return True, "cpu:i5-14600k", "i5-14600K", price, "< 1000"
+        return False, "cpu:i5-14600k", "i5-14600K", price, ">= 1000"
 
     # GPUs - AJUSTADAS: removido 5050 e 7600, validação de preço realista
     if RTX5060_RE.search(t):
@@ -447,12 +453,12 @@ def classify_and_match(text: str):
         if price < 125: return True, "mala_bordo", "Mala de Bordo", price, "< 125"
         return False, "mala_bordo", "Mala de Bordo", price, ">= 125"
 
-    # MONITOR LG UltraGear 24" 180Hz - ESPECÍFICO COM "Corre!🔥"
-    if MONITOR_LG_24_RE.search(t):
-        if not price: return False, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", None, "sem preço"
-        if price < 200: return False, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", price, "preço irreal (< 200)"
-        if price < 700: return True, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", price, "< 700"
-        return False, "monitor:lg24", "Monitor LG UltraGear 24\" 180Hz", price, ">= 700"
+    # MONITOR LG UltraGear 27" 180Hz - ESPECÍFICO COM "Corre!🔥"
+    if MONITOR_LG_27_RE.search(t):
+        if not price: return False, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", None, "sem preço"
+        if price < 200: return False, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", price, "preço irreal (< 200)"
+        if price < 700: return True, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", price, "< 700"
+        return False, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", price, ">= 700"
 
     # MONITORES - 27"+ APENAS com 144Hz ou superior
     if MONITOR_RE.search(t) and MONITOR_SIZE_RE.search(t) and MONITOR_144HZ_RE.search(t):
@@ -597,8 +603,8 @@ def main():
                     if ok:
                         header = get_header_text(key) if needs_header(key, price) else ""
                         msg = f"{header}{msg_text}\n\n— via {chan_disp}"
-                        log.info("[%-18s] MATCH → %s | price=%s | key=%s | reason=%s",
-                                 chan_disp, title, price_disp, key, reason)
+                        log.info("[%-18s] MATCH → %s | price=%s | key=%s | reason=%s | header=%s",
+                                 chan_disp, title, price_disp, key, reason, "YES" if header else "NO")
                         # send to destinations (guard exceptions)
                         try:
                             notify_all(msg)
