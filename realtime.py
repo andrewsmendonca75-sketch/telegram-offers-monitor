@@ -300,11 +300,10 @@ MALA_BORDO_RE = re.compile(r"\bmala\b.*\bbordo\b|\bbordo\b.*\bmala\b", re.I)
 # Monitores
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
 
-# Monitor LG UltraGear 27" específico (com Corre!🔥) - MUITO ESPECÍFICO
+# Monitor LG UltraGear 27" 180Hz FHD específico (com Corre!🔥) - ULTRA ESPECÍFICO
 MONITOR_LG_27_RE = re.compile(
-    r"\blg\s*ultragear\b.*\b27\s*[\"\'']?.*\b180\s*hz\b|"
-    r"\b27gs60f\b|"
-    r"\blg\b.*\b27\s*[\"\'']?.*\bultragear\b.*\b180\s*hz\b",
+    r"\b27gs60f\b|"  # Modelo exato
+    r"(?=.*\blg\b)(?=.*\bultragear\b)(?=.*\b27\s*[\"\'']?)(?=.*\b180\s*hz\b)(?=.*\b(?:fhd|full\s*hd)\b)",  # LG + UltraGear + 27" + 180Hz + FHD
     re.I
 )
 
