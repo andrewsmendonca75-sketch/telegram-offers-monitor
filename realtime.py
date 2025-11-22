@@ -242,6 +242,7 @@ PC_GAMER_RE = re.compile(r"\b(pc\s*gamer|setup\s*completo|kit\s*completo)\b", re
 
 # GPUs - REMOVIDAS: RTX 5050 e RX 7600
 RTX5060_RE   = re.compile(r"\brtx\s*5060(?!\s*ti)\b", re.I)
+RTX5060TI_RE = re.compile(r"\brtx\s*5060\s*ti\b", re.I)
 RTX5070_FAM  = re.compile(r"\brtx\s*5070(\s*ti)?\b", re.I)
 
 # CPUs
@@ -300,6 +301,9 @@ MALA_BORDO_RE = re.compile(r"\bmala\b.*\bbordo\b|\bbordo\b.*\bmala\b", re.I)
 # Monitores
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
 
+# BLOQUEIO: Monitores 24", 25", 26" (qualquer menção)
+MONITOR_SMALL_RE = re.compile(r"\b(24|25|26)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b", re.I)
+
 # Monitor LG UltraGear 27" 180Hz FHD específico (com Corre!🔥) - ULTRA ESPECÍFICO
 MONITOR_LG_27_RE = re.compile(
     r"\b27gs60f\b|"  # Modelo exato
@@ -318,10 +322,11 @@ def needs_header(product_key: str, price: Optional[float]) -> bool:
     """Define quando usar cabeçalho 'Corre!🔥' ou 'Oportunidade🔥'"""
     if not price: return False
     if product_key == "gpu:rtx5060" and price < 1900: return True
+    if product_key == "gpu:rtx5060ti" and price < 2000: return True  # RTX 5060 Ti com Corre!🔥
     if product_key.startswith("cpu:") and price < 900: return True
     if product_key == "ar_premium" and price < 1850: return True
-    if product_key == "dualsense" and price < 300: return True  # DualSense com Corre!🔥
-    if product_key == "monitor:lg27" and price < 700: return True  # LG UltraGear 27" com Corre!🔥
+    if product_key == "dualsense" and price < 300: return True
+    if product_key == "monitor:lg27" and price < 700: return True
     return False
 
 def get_header_text(product_key: str) -> str:
@@ -352,7 +357,13 @@ def classify_and_match(text: str):
         if price < 1000: return True, "cpu:i5-14600k", "i5-14600K", price, "< 1000"
         return False, "cpu:i5-14600k", "i5-14600K", price, ">= 1000"
 
-    # GPUs - AJUSTADAS: removido 5050 e 7600, validação de preço realista
+    # GPUs - REFORÇADO: RTX 5060 e 5060 Ti com validação
+    if RTX5060TI_RE.search(t):
+        if not price: return False, "gpu:rtx5060ti", "RTX 5060 Ti", None, "sem preço"
+        if price < 1500: return False, "gpu:rtx5060ti", "RTX 5060 Ti", price, "preço irreal (< 1500)"
+        if price < 2000: return True, "gpu:rtx5060ti", "RTX 5060 Ti", price, "< 2000"
+        return False, "gpu:rtx5060ti", "RTX 5060 Ti", price, ">= 2000"
+    
     if RTX5060_RE.search(t):
         if not price: return False, "gpu:rtx5060", "RTX 5060", None, "sem preço"
         if price < 1500: return False, "gpu:rtx5060", "RTX 5060", price, "preço irreal (< 1500)"
