@@ -453,8 +453,17 @@ def classify_and_match(text: str):
 
     # Ar-condicionados GERAIS (outros modelos)
     if AR_CONDICIONADO_RE.search(t):
-        if price and price < 1850: return True, "ar_condicionado", "Ar Condicionado", price, "< 1850"
-        return False, "ar_condicionado", "Ar Condicionado", price, ">= 1850 ou sem preço"
+        if not price: return False, "ar_condicionado", "Ar Condicionado", None, "sem preço"
+        if price < 1000: return False, "ar_condicionado", "Ar Condicionado", price, "preço irreal (< 1000)"
+        if price < 1850: return True, "ar_condicionado", "Ar Condicionado", price, "< 1850"
+        return False, "ar_condicionado", "Ar Condicionado", price, ">= 1850"
+
+    # KINDLE - até 350 reais (MOVIDO PARA ANTES DE TÊNIS)
+    if KINDLE_RE.search(t):
+        if not price: return False, "kindle", "Kindle", None, "sem preço"
+        if price < 100: return False, "kindle", "Kindle", price, "preço irreal (< 100)"
+        if price <= 350: return True, "kindle", "Kindle", price, "<= 350"
+        return False, "kindle", "Kindle", price, "> 350"
 
     if TENIS_NIKE_RE.search(t):
         if price and price < 250: return True, "tenis_nike", "Tênis Nike", price, "< 250"
