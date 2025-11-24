@@ -298,11 +298,19 @@ WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
 # Mala de bordo
 MALA_BORDO_RE = re.compile(r"\bmala\b.*\bbordo\b|\bbordo\b.*\bmala\b", re.I)
 
+# Kindle
+KINDLE_RE = re.compile(r"\bkindle\b", re.I)
+
 # Monitores
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
 
-# BLOQUEIO: Monitores 24", 25", 26" (qualquer menção)
-MONITOR_SMALL_RE = re.compile(r"\b(24|25|26)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b", re.I)
+# BLOQUEIO: Monitores 24", 25", 26" (qualquer menção) - EXPANDIDO
+MONITOR_SMALL_RE = re.compile(
+    r"\b(22|23|24|25|26)\s*[\"\'']?\s*(pol|polegadas?|\"|\')?\b|"
+    r"\b(22|23|24|25|26)[\"\'']|"
+    r"(?:monitor|display|tela)\s+(?:gamer\s+)?(?:de\s+)?(22|23|24|25|26)",
+    re.I
+)
 
 # Monitor LG UltraGear 27" 180Hz FHD específico (com Corre!🔥) - ULTRA ESPECÍFICO
 MONITOR_LG_27_RE = re.compile(
