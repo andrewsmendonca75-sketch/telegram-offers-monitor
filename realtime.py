@@ -240,12 +240,18 @@ def find_lowest_price(text: str) -> Optional[float]:
 BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook|geladeira|refrigerador|smart\s*tv|televisão|televisao|tv\s+\d+|m[aá]quina\s*de\s*lavar|lavadora|lava\s*e\s*seca)\b", re.I)
 PC_GAMER_RE = re.compile(r"\b(pc\s*gamer|setup\s*completo|kit\s*completo)\b", re.I)
 
-# GPUs - REMOVIDAS: RTX 5050 e RX 7600
+# GPUs - Detecção de fans
+RTX5060_2FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(2\s*(?:fans?|oc|x)|dual\s*fan)\b|\b(2\s*(?:fans?|oc|x)|dual\s*fan)\b.*\brtx\s*5060(?!\s*ti)\b", re.I)
+RTX5060_3FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(3\s*(?:fans?|oc|x)|triple\s*fan)\b|\b(3\s*(?:fans?|oc|x)|triple\s*fan)\b.*\brtx\s*5060(?!\s*ti)\b", re.I)
 RTX5060_RE   = re.compile(r"\brtx\s*5060(?!\s*ti)\b", re.I)
 RTX5060TI_RE = re.compile(r"\brtx\s*5060\s*ti\b", re.I)
 RTX5070_FAM  = re.compile(r"\brtx\s*5070(\s*ti)?\b", re.I)
 
-# CPUs
+# CPUs - Específicos com limites diferentes
+RYZEN_7_5700X_RE = re.compile(r"\bryzen\s*7\s*5700x\b", re.I)
+I5_14400F_RE = re.compile(r"\bi5[-\s]*14400f\b", re.I)
+
+# CPUs gerais
 INTEL_SUP = re.compile(r"\b(i5[-\s]*14[4-9]\d{2}[kf]*|i5[-\s]*145\d{2}[kf]*|i7[-\s]*14\d{3}[kf]*|i9[-\s]*14\d{3}[kf]*)\b", re.I)
 AMD_SUP   = re.compile(r"\b(ryzen\s*7\s*5700x[3d]*|ryzen\s*7\s*5800x[3d]*|ryzen\s*9\s*5900x|ryzen\s*9\s*5950x)\b", re.I)
 AMD_BLOCK = re.compile(r"\b(ryzen\s*(?:3|5)\s|5600g?t?|5500|5700(?!x))\b", re.I)
@@ -258,11 +264,16 @@ LGA1700_RE  = re.compile(r"\b(b660m?|b760m?|z690|z790)\b", re.I)  # Removido H61
 SPECIFIC_B760M_RE = re.compile(r"\bb760m\b", re.I)
 INTEL_14600K_RE   = re.compile(r"\bi5[-\s]*14600k\b", re.I)
 
-# Gabinete - Sem restrição de fans
-GAB_RE     = re.compile(r"\bgabinete\b", re.I)
+# Gabinete - REMOVIDO
+# GAB_RE     = re.compile(r"\bgabinete\b", re.I)
 
-# Coolers - APENAS Water Cooler 240mm
-WATER_240MM_RE = re.compile(r"\bwater\s*cooler\b.*\b240\s*mm\b|\b240\s*mm\b.*\bwater\s*cooler\b", re.I)
+# Coolers - APENAS Water Cooler 240mm ARGB
+WATER_240MM_ARGB_RE = re.compile(
+    r"\bwater\s*cooler\b.*\b240\s*mm\b.*\bargb\b|"
+    r"\bargb\b.*\bwater\s*cooler\b.*\b240\s*mm\b|"
+    r"\b240\s*mm\b.*\bwater\s*cooler\b.*\bargb\b",
+    re.I
+)
 
 # SSD - APENAS Kingston
 SSD_RE  = re.compile(r"\bssd\b.*\bkingston\b|\bkingston\b.*\bssd\b", re.I)
@@ -284,13 +295,8 @@ DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s
 # RAM - APENAS Geil Orion específica
 RAM_GEIL_ORION_RE = re.compile(r"\bgeil\s*orion\b.*\b16\s*gb\b|\b16\s*gb\b.*\bgeil\s*orion\b", re.I)
 
-AR_CONDICIONADO_RE = re.compile(r"\b(ar\s*condicionado|split|inverter)\b", re.I)
-
-# Ar-condicionados PREMIUM específicos (com Oportunidade🔥)
-AR_PREMIUM_RE = re.compile(
-    r"\b(daikin\s+ecoswing|fujitsu\s+premium|samsung\s+windfree|elgin\s+eco\s+ii|gree\s+g[-\s]*top)\b",
-    re.I
-)
+# Ar-condicionado INVERTER - apenas < 1500 e inverter
+AR_INVERTER_RE = re.compile(r"\bar\s*condicionado\b.*\binverter\b|\binverter\b.*\bar\s*condicionado\b", re.I)
 
 TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
 WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
@@ -298,11 +304,17 @@ WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b|\b4k\b.*\bwebcam\b", re.I)
 # Mala de bordo
 MALA_BORDO_RE = re.compile(r"\bmala\b.*\bbordo\b|\bbordo\b.*\bmala\b", re.I)
 
-# Kindle
+# Kindle - aumentado para 470
 KINDLE_RE = re.compile(r"\bkindle\b", re.I)
+
+# Cafeteira programável
+CAFETEIRA_PROG_RE = re.compile(r"\bcafeteira\b.*\bprogr[aá]m[aá]vel\b|\bprogr[aá]m[aá]vel\b.*\bcafeteira\b", re.I)
 
 # Monitores
 MONITOR_RE = re.compile(r"\bmonitor\b", re.I)
+
+# Monitor OLED
+MONITOR_OLED_RE = re.compile(r"\bmonitor\b.*\boled\b|\boled\b.*\bmonitor\b", re.I)
 
 # BLOQUEIO: Monitores 24", 25", 26" (qualquer menção) - EXPANDIDO
 MONITOR_SMALL_RE = re.compile(
@@ -329,10 +341,12 @@ MONITOR_144HZ_RE = re.compile(r"\b(14[4-9]|1[5-9]\d|[2-9]\d{2})\s*hz\b", re.I)
 def needs_header(product_key: str, price: Optional[float]) -> bool:
     """Define quando usar cabeçalho 'Corre!🔥' ou 'Oportunidade🔥'"""
     if not price: return False
-    if product_key == "gpu:rtx5060" and price < 1900: return True
-    if product_key == "gpu:rtx5060ti" and price < 2000: return True  # RTX 5060 Ti com Corre!🔥
+    if product_key == "gpu:rtx5060:3fan" and price < 1950: return True
+    if product_key == "gpu:rtx5060:2fan" and price < 1850: return True
+    if product_key == "gpu:rtx5060ti" and price < 2100: return True
+    if product_key == "cpu:ryzen7_5700x" and price < 800: return True
+    if product_key == "cpu:i5_14400f" and price < 750: return True
     if product_key.startswith("cpu:") and price < 900: return True
-    if product_key == "ar_premium" and price < 1850: return True
     if product_key == "dualsense" and price < 300: return True
     if product_key == "monitor:lg27" and price < 700: return True
     return False
@@ -365,12 +379,24 @@ def classify_and_match(text: str):
         if price < 1000: return True, "cpu:i5-14600k", "i5-14600K", price, "< 1000"
         return False, "cpu:i5-14600k", "i5-14600K", price, ">= 1000"
 
-    # GPUs - REFORÇADO: RTX 5060 e 5060 Ti com validação
+    # GPUs - Ordem: 3 fans > 2 fans > genérica > Ti > 5070
+    if RTX5060_3FAN_RE.search(t):
+        if not price: return False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", None, "sem preço"
+        if price < 1500: return False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, "preço irreal (< 1500)"
+        if price < 1950: return True, "gpu:rtx5060:3fan", "RTX 5060 Triple Fan", price, "< 1950"
+        return False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, ">= 1950"
+    
+    if RTX5060_2FAN_RE.search(t):
+        if not price: return False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", None, "sem preço"
+        if price < 1500: return False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, "preço irreal (< 1500)"
+        if price < 1850: return True, "gpu:rtx5060:2fan", "RTX 5060 Dual Fan", price, "< 1850"
+        return False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, ">= 1850"
+    
     if RTX5060TI_RE.search(t):
         if not price: return False, "gpu:rtx5060ti", "RTX 5060 Ti", None, "sem preço"
         if price < 1500: return False, "gpu:rtx5060ti", "RTX 5060 Ti", price, "preço irreal (< 1500)"
-        if price < 2000: return True, "gpu:rtx5060ti", "RTX 5060 Ti", price, "< 2000"
-        return False, "gpu:rtx5060ti", "RTX 5060 Ti", price, ">= 2000"
+        if price < 2100: return True, "gpu:rtx5060ti", "RTX 5060 Ti", price, "< 2100"
+        return False, "gpu:rtx5060ti", "RTX 5060 Ti", price, ">= 2100"
     
     if RTX5060_RE.search(t):
         if not price: return False, "gpu:rtx5060", "RTX 5060", None, "sem preço"
@@ -381,16 +407,30 @@ def classify_and_match(text: str):
     if RTX5070_FAM.search(t):
         if not price: return False, "gpu:rtx5070", "RTX 5070/5070 Ti", None, "sem preço"
         if price < 2500: return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "preço irreal (< 2500)"
-        if price < 3700: return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "< 3700"
-        return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">= 3700"
+        if price < 3500: return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "< 3500"
+        return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">= 3500"
 
-    # CPUs - REFORÇADO: i5-14400F ou superior, Ryzen 7 5700X ou superior
+    # CPUs - PRIORIDADES: Ryzen 7 5700X e i5-14400F específicos
     if AMD_BLOCK.search(t): return False, "cpu:amd:block", "CPU AMD inferior", price, "Ryzen 3/5 bloqueado"
+    
+    if RYZEN_7_5700X_RE.search(t):
+        if not price: return False, "cpu:ryzen7_5700x", "Ryzen 7 5700X", None, "sem preço"
+        if price < 400: return False, "cpu:ryzen7_5700x", "Ryzen 7 5700X", price, "preço irreal (< 400)"
+        if price < 800: return True, "cpu:ryzen7_5700x", "Ryzen 7 5700X", price, "< 800"
+        return False, "cpu:ryzen7_5700x", "Ryzen 7 5700X", price, ">= 800"
+    
+    if I5_14400F_RE.search(t):
+        if not price: return False, "cpu:i5_14400f", "i5-14400F", None, "sem preço"
+        if price < 400: return False, "cpu:i5_14400f", "i5-14400F", price, "preço irreal (< 400)"
+        if price < 750: return True, "cpu:i5_14400f", "i5-14400F", price, "< 750"
+        return False, "cpu:i5_14400f", "i5-14400F", price, ">= 750"
+    
     if INTEL_SUP.search(t):
         if not price: return False, "cpu:intel", "CPU Intel sup.", None, "sem preço"
         if price < 400: return False, "cpu:intel", "CPU Intel sup.", price, "preço irreal (< 400)"
         if price < 900: return True, "cpu:intel", "CPU Intel sup. (i5-14400F+)", price, "< 900"
         return False, "cpu:intel", "CPU Intel sup.", price, ">= 900"
+    
     if AMD_SUP.search(t):
         if not price: return False, "cpu:amd", "CPU AMD sup.", None, "sem preço"
         if price < 400: return False, "cpu:amd", "CPU AMD sup.", price, "preço irreal (< 400)"
@@ -407,18 +447,12 @@ def classify_and_match(text: str):
         if price < 550: return True, "mobo:lga1700", "LGA1700 (B660/B760/Z690/Z790)", price, "< 550"
         return False, "mobo:lga1700", "LGA1700", price, ">= 550"
 
-    # GABINETE - Apenas abaixo de 120, sem restrição de fans
-    if GAB_RE.search(t):
-        if not price: return False, "case", "Gabinete", None, "sem preço"
-        if price < 120: return True, "case", "Gabinete", price, "< 120"
-        return False, "case", "Gabinete", price, ">= 120"
-
-    # WATER COOLER - APENAS 240mm abaixo de 200
-    if WATER_240MM_RE.search(t):
-        if not price: return False, "cooler:water240", "Water Cooler 240mm", None, "sem preço"
-        if price < 50: return False, "cooler:water240", "Water Cooler 240mm", price, "preço irreal (< 50)"
-        if price < 200: return True, "cooler:water240", "Water Cooler 240mm", price, "< 200"
-        return False, "cooler:water240", "Water Cooler 240mm", price, ">= 200"
+    # WATER COOLER - APENAS 240mm ARGB abaixo de 200
+    if WATER_240MM_ARGB_RE.search(t):
+        if not price: return False, "cooler:water240argb", "Water Cooler 240mm ARGB", None, "sem preço"
+        if price < 50: return False, "cooler:water240argb", "Water Cooler 240mm ARGB", price, "preço irreal (< 50)"
+        if price < 200: return True, "cooler:water240argb", "Water Cooler 240mm ARGB", price, "< 200"
+        return False, "cooler:water240argb", "Water Cooler 240mm ARGB", price, ">= 200"
 
     # SSD - APENAS Kingston M.2 1TB
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
@@ -434,36 +468,37 @@ def classify_and_match(text: str):
 
     # NOVAS CATEGORIAS
     if CADEIRA_RE.search(t):
-        if price and price < 500: return True, "cadeira", "Cadeira Gamer", price, "< 500"
-        return False, "cadeira", "Cadeira Gamer", price, ">= 500 ou sem preço"
+        if not price: return False, "cadeira", "Cadeira", None, "sem preço"
+        if price >= 300 and price < 500: return True, "cadeira", "Cadeira Gamer", price, "entre 300-500"
+        return False, "cadeira", "Cadeira", price, "fora da faixa 300-500"
 
-    # DualSense - AGORA COM "Corre!🔥"
+    # DualSense - COM "Corre!🔥"
     if DUALSENSE_RE.search(t):
         if not price: return False, "dualsense", "Controle PS5 DualSense", None, "sem preço"
         if price < 200: return False, "dualsense", "Controle PS5 DualSense", price, "preço irreal (< 200)"
         if price < 300: return True, "dualsense", "Controle PS5 DualSense", price, "< 300"
         return False, "dualsense", "Controle PS5 DualSense", price, ">= 300"
 
-    # Ar-condicionados PREMIUM - verifica PRIMEIRO
-    if AR_PREMIUM_RE.search(t):
-        if not price: return False, "ar_premium", "Ar Condicionado Premium", None, "sem preço"
-        if price < 1000: return False, "ar_premium", "Ar Condicionado Premium", price, "preço irreal (< 1000)"
-        if price < 1850: return True, "ar_premium", "Ar Condicionado Premium", price, "< 1850"
-        return False, "ar_premium", "Ar Condicionado Premium", price, ">= 1850"
+    # Ar-condicionado INVERTER < 1500
+    if AR_INVERTER_RE.search(t):
+        if not price: return False, "ar_inverter", "Ar Condicionado Inverter", None, "sem preço"
+        if price < 1000: return False, "ar_inverter", "Ar Condicionado Inverter", price, "preço irreal (< 1000)"
+        if price < 1500: return True, "ar_inverter", "Ar Condicionado Inverter", price, "< 1500"
+        return False, "ar_inverter", "Ar Condicionado Inverter", price, ">= 1500"
 
-    # Ar-condicionados GERAIS (outros modelos)
-    if AR_CONDICIONADO_RE.search(t):
-        if not price: return False, "ar_condicionado", "Ar Condicionado", None, "sem preço"
-        if price < 1000: return False, "ar_condicionado", "Ar Condicionado", price, "preço irreal (< 1000)"
-        if price < 1850: return True, "ar_condicionado", "Ar Condicionado", price, "< 1850"
-        return False, "ar_condicionado", "Ar Condicionado", price, ">= 1850"
-
-    # KINDLE - até 350 reais (MOVIDO PARA ANTES DE TÊNIS)
+    # KINDLE - até 470 reais
     if KINDLE_RE.search(t):
         if not price: return False, "kindle", "Kindle", None, "sem preço"
         if price < 100: return False, "kindle", "Kindle", price, "preço irreal (< 100)"
-        if price <= 350: return True, "kindle", "Kindle", price, "<= 350"
-        return False, "kindle", "Kindle", price, "> 350"
+        if price <= 470: return True, "kindle", "Kindle", price, "<= 470"
+        return False, "kindle", "Kindle", price, "> 470"
+
+    # CAFETEIRA PROGRAMÁVEL
+    if CAFETEIRA_PROG_RE.search(t):
+        if not price: return False, "cafeteira", "Cafeteira Programável", None, "sem preço"
+        if price < 50: return False, "cafeteira", "Cafeteira Programável", price, "preço irreal (< 50)"
+        if price < 500: return True, "cafeteira", "Cafeteira Programável", price, "< 500"
+        return False, "cafeteira", "Cafeteira Programável", price, ">= 500"
 
     if TENIS_NIKE_RE.search(t):
         if price and price < 250: return True, "tenis_nike", "Tênis Nike", price, "< 250"
