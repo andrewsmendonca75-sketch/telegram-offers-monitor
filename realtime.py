@@ -1,16 +1,14 @@
-# monitor_updated_full.py
+# monitor_updated_full_with_debug.py
 # -*- coding: utf-8 -*-
 """
-Realtime Telegram monitor (Telethon) - versão ajustada (integra alterações pedidas)
-
-Principais mudanças:
-- mobos até 600 reais (com sanity checks)
-- ssd kingston m.2 1tb até 400
-- memórias: qualquer 16GB DDR4 3200
-- removida mala de bordo
-- TV <= 1000; TV Box até 200
-- parser de preços mais robusto (context windows, ignora cupom/off quando perto do número)
-- uniformiza retorno do classify_and_match para (ok, key, title, price, reason)
+Realtime Telegram monitor (Telethon) - versão ajustada com debug
+- Logs detalhados de candidatos de preço e avaliação de regras
+- TV apenas 40" ou maior (>=40) e <= 1000
+- TV Box separado (<=200)
+- SSD Kingston M.2 1TB <=400
+- RAM 16GB DDR4 3200 (qualquer marca) <=300
+- Placas-mãe LGA1700/B760 <=600 (>=300 sanity)
+- Cupom tratado com cuidado para não invalidar preços legítimos
 """
 
 import os
@@ -151,7 +149,7 @@ def notify_all(text: str):
             log.error("· envio=ERRO → %s | motivo=%s", d, msg)
 
 # ---------------------------------------------
-# PRICE PARSER (BRL) - robust context-aware
+# PRICE PARSER (BRL) - robust context-aware + debug
 # ---------------------------------------------
 PRICE_PIX_RE = re.compile(
     r"(?i)r\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{1,2})?)\s*(?:no\s*pix|à\s*vista|a\s*vista|à\s*vista:|avista)",
@@ -177,38 +175,75 @@ def _to_float_brl(raw: str) -> Optional[float]:
         return None
 
 def find_lowest_price(text: str) -> Optional[float]:
-    """Find plausible lowest price in text, ignoring coupon/off values when they are adjacent."""
+    """Find plausible lowest price in text, ignoring coupon/off values when they are adjacent.
+
+    Additional behavior: logs candidate prices and reasons for debugging.
+    """
     if not text:
         return None
     txt = URL_RE.sub(" ", text)
     vals: List[float] = []
+    candidates = []  # tuples: (raw_string, span_start, span_end, parsed_value_or_None, reason)
 
     def valid_context(m):
         start = m.start(); end = m.end()
         s_start = max(0, start - 12); s_end = min(len(txt), end + 12)
-        if SMALL_NEG_RE.search(txt[s_start:s_end]):
-            return False
+        small_ctx = txt[s_start:s_end]
+        small_bad = SMALL_NEG_RE.search(small_ctx)
+        if small_bad:
+            token = small_bad.group(0).lower()
+            # treat 'cupom' specially: only reject if it appears BEFORE the number (adjacent)
+            if "cupom" in token:
+                pos = txt.find(small_bad.group(0), s_start, s_end)
+                if pos != -1 and pos < start:
+                    return False
+                # if 'cupom' is after the number, do not reject here
+            else:
+                return False
         b_start = max(0, start - 80); b_end = min(len(txt), end + 80)
-        if BIG_NEG_RE.search(txt[b_start:b_end]):
+        big_ctx = txt[b_start:b_end]
+        if BIG_NEG_RE.search(big_ctx):
             return False
         return True
 
-    # explicit à vista / pix
+    # explicit à vista / pix first
     for m in PRICE_PIX_RE.finditer(txt):
-        if not valid_context(m):
-            continue
-        v = _to_float_brl(m.group(1))
-        if v is not None and v >= 10:
-            vals.append(v)
+        raw = m.group(1)
+        parsed = _to_float_brl(raw)
+        ok_ctx = valid_context(m)
+        if parsed is not None and parsed >= 10 and ok_ctx:
+            vals.append(parsed)
+            candidates.append((raw, m.start(), m.end(), parsed, "pix-accepted"))
+        else:
+            reason = "pix-rejected"
+            if parsed is None:
+                reason += ":no-parse"
+            elif parsed < 10:
+                reason += ":too-small"
+            elif not ok_ctx:
+                reason += ":ctx-reject"
+            candidates.append((raw, m.start(), m.end(), parsed, reason))
 
     # fallback any R$
     if not vals:
         for m in PRICE_FALLBACK_RE.finditer(txt):
-            if not valid_context(m):
-                continue
-            v = _to_float_brl(m.group(1))
-            if v is not None and v >= 10:
-                vals.append(v)
+            raw = m.group(1)
+            parsed = _to_float_brl(raw)
+            ok_ctx = valid_context(m)
+            if parsed is not None and parsed >= 10 and ok_ctx:
+                vals.append(parsed)
+                candidates.append((raw, m.start(), m.end(), parsed, "fallback-accepted"))
+            else:
+                rej = "no-parse" if parsed is None else ("too-small" if parsed is not None and parsed < 10 else "ctx-reject")
+                candidates.append((raw, m.start(), m.end(), parsed, "fallback-rejected:" + rej))
+
+    # Log candidates for debugging
+    try:
+        if os.getenv("LOG_PRICE_CANDIDATES", "1") == "1":
+            for raw, s, e, parsed, reason in candidates:
+                log.info("PRICE_CANDIDATE | raw=%s | span=(%d-%d) | parsed=%s | reason=%s", raw, s, e, str(parsed), reason)
+    except Exception:
+        log.exception("Erro ao logar price candidates")
 
     return min(vals) if vals else None
 
@@ -218,9 +253,12 @@ def find_lowest_price(text: str) -> Optional[float]:
 BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook|geladeira|refrigerador|m[aá]quina\s*de\s*lavar|lavadora|lava\s*e\s*seca)\b", re.I)
 PC_GAMER_RE = re.compile(r"\b(pc\s*gamer|setup\s*completo|kit\s*completo)\b", re.I)
 
-# TV Box: specific boxes only (mi/xiaomi/mi box / android tv box)
+# TV box: specific boxes only
 TVBOX_RE = re.compile(r"\b(?:tv\s*box|xiaomi\s*box|mi\s*box|mi-box|android\s*tv\s*box)\b", re.I)
+# TV generic mentions
 TV_RE = re.compile(r"\b(?:tv|smart\s*tv|televis(?:ão|ao))\b", re.I)
+# TV sizes — only 40 or larger
+TV_SIZE_RE = re.compile(r"\b(40|41|42|43|44|45|48|49|50|55|58|60|65|70|75|77|80)\s*(?:\"|\'|pol|polegadas?)\b", re.I)
 
 # Monitors
 MONITOR_SMALL_RE = re.compile(r"\b(19|20|21|22|23|24|25|26)\s*(?:\"|\'|pol|polegadas?)\b|\bmonitor\b.*\b(19|20|21|22|23|24|25|26)\b", re.I)
@@ -243,7 +281,7 @@ TB1_RE  = re.compile(r"\b1\s*tb\b", re.I)
 # RAM 16GB DDR4 3200 (any brand)
 RAM_16GB_3200_RE = re.compile(r"\b(?:ddr4)\b.*\b16\s*gb\b.*\b3200\b|\b16\s*gb\b.*\b(?:ddr4)\b.*\b3200\b", re.I)
 
-# Other categories (abrangendo pedidos anteriores)
+# Other
 WATER_240MM_ARGB_RE = re.compile(r"\bwater\s*cooler\b.*\b240\s*mm\b.*\bargb\b", re.I)
 DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s*5)\b", re.I)
 AR_INVERTER_RE = re.compile(r"\bar\s*condicionado\b.*\binverter\b|\binverter\b.*\bar\s*condicionado\b", re.I)
@@ -252,7 +290,7 @@ CAFETEIRA_PROG_RE = re.compile(r"\bcafeteira\b.*\bprogr[aá]m[aá]vel\b", re.I)
 TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
 WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b", re.I)
 
-# GPUs / CPUs (kept original structure)
+# GPUs / CPUs (kept)
 RTX5060_3FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(3\s*(?:fans?|oc|x)|triple\s*fan)\b|\b(3\s*(?:fans?|oc|x)|triple\s*fan)\b.*\brtx\s*5060(?!\s*ti)\b", re.I)
 RTX5060_2FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(2\s*(?:fans?|oc|x)|dual\s*fan)\b|\b(2\s*(?:fans?|oc|x)|dual\s*fan)\b.*\brtx\s*5060(?!\s*ti)\b", re.I)
 RTX5060_RE   = re.compile(r"\brtx\s*5060(?!\s*ti)\b", re.I)
@@ -286,145 +324,162 @@ def get_header_text(product_key: str) -> str:
     return "Corre!🔥 "
 
 # ---------------------------------------------
-# CORE MATCHER (uniform return)
+# CORE MATCHER (with debug logs)
 # ---------------------------------------------
 def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]:
     """
     Returns (ok: bool, key: str, title: str, price: Optional[float], reason: str)
+
+    This version logs which rule attempted to match and why.
     """
     t = text or ""
+
+    def rule_log(rule_name, ok, key, title, price, reason):
+        log.info("RULE_EVAL | rule=%s | ok=%s | key=%s | title=%s | price=%s | reason=%s",
+                 rule_name, str(ok), key, title, f"{price:.2f}" if isinstance(price, (int,float)) else str(price), reason)
+
     if BLOCK_CATS.search(t):
+        rule_log("block:cat", False, "block:cat", "Categoria bloqueada", None, "categoria bloqueada")
         return False, "block:cat", "Categoria bloqueada", None, "Categoria bloqueada"
     if PC_GAMER_RE.search(t):
+        rule_log("block:pcgamer", False, "block:pcgamer", "PC Gamer bloqueado", None, "PC Gamer bloqueado")
         return False, "block:pcgamer", "PC Gamer bloqueado", None, "PC Gamer bloqueado"
 
     price = find_lowest_price(t)
 
+    def ret(rule_name, ok, key, title, price_val, reason):
+        rule_log(rule_name, ok, key, title, price_val, reason)
+        return ok, key, title, price_val, reason
+
     # TV Box – <= 200
     if TVBOX_RE.search(t):
         if price is None:
-            return False, "tvbox", "TV Box", None, "sem preço"
+            return ret("tvbox", False, "tvbox", "TV Box", None, "sem preço")
         if price <= 200:
-            return True, "tvbox", "TV Box", price, "<= 200"
-        return False, "tvbox", "TV Box", price, "> 200"
+            return ret("tvbox", True, "tvbox", "TV Box", price, "<= 200")
+        return ret("tvbox", False, "tvbox", "TV Box", price, "> 200")
 
-    # TV – <= 1000
+    # TV – only 40" or bigger (user requested) and <=1000
     if TV_RE.search(t):
+        # require explicit size >=40
+        if not TV_SIZE_RE.search(t):
+            return ret("tv", False, "tv", "TV / Smart TV", price, "tamanho <40 ou não informado")
+        # if size present, check price
         if price is None:
-            return False, "tv", "TV / Smart TV", None, "sem preço"
+            return ret("tv", False, "tv", "TV / Smart TV", None, "sem preço")
         if price < 200:
-            return False, "tv", "TV / Smart TV", price, "preço irreal (<200)"
+            return ret("tv", False, "tv", "TV / Smart TV", price, "preço irreal (<200)")
         if price <= 1000:
-            return True, "tv", "TV / Smart TV", price, "<= 1000"
-        return False, "tv", "TV / Smart TV", price, "> 1000"
+            return ret("tv", True, "tv", "TV / Smart TV", price, "<= 1000")
+        return ret("tv", False, "tv", "TV / Smart TV", price, "> 1000")
 
     # Block small monitors <27"
     if MONITOR_SMALL_RE.search(t):
-        return False, "monitor:block_small", "Monitor < 27\"", price, "tamanho pequeno"
+        return ret("monitor:block_small", False, "monitor:block_small", "Monitor < 27\"", price, "tamanho pequeno")
 
-    # Placas-mãe (B660/B760/Z690/Z790) — match se <600 e >=300
+    # Mobos
     if A520_RE.search(t):
-        return False, "mobo:a520", "A520", price, "A520 bloqueada"
+        return ret("mobo:a520", False, "mobo:a520", "A520 bloqueada", price, "A520 bloqueada")
     if H610_RE.search(t):
-        return False, "mobo:h610", "H610", price, "H610 bloqueada"
+        return ret("mobo:h610", False, "mobo:h610", "H610 bloqueada", price, "H610 bloqueada")
     if LGA1700_RE.search(t) or SPECIFIC_B760M_RE.search(t):
         if price is None:
-            return False, "mobo:lga1700", "Placa-mãe LGA1700/B760", None, "sem preço"
+            return ret("mobo:lga1700", False, "mobo:lga1700", "Placa-mãe LGA1700/B760", None, "sem preço")
         if price < 300:
-            return False, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, "preço irreal (<300)"
+            return ret("mobo:lga1700", False, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, "preço irreal (<300)")
         if price < 600:
-            return True, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, "<600"
-        return False, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, ">=600"
+            return ret("mobo:lga1700", True, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, "<600")
+        return ret("mobo:lga1700", False, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, ">=600")
 
-    # GPUs (kept)
+    # GPUs
     if RTX5060_3FAN_RE.search(t):
         if price is None:
-            return False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", None, "sem preço"
+            return ret("gpu:rtx5060:3fan", False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", None, "sem preço")
         if price < 1500:
-            return False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, "preço irreal (<1500)"
+            return ret("gpu:rtx5060:3fan", False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, "preço irreal (<1500)")
         if price < 1950:
-            return True, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, "<1950"
-        return False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, ">=1950"
+            return ret("gpu:rtx5060:3fan", True, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, "<1950")
+        return ret("gpu:rtx5060:3fan", False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", price, ">=1950")
     if RTX5060_2FAN_RE.search(t):
         if price is None:
-            return False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", None, "sem preço"
+            return ret("gpu:rtx5060:2fan", False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", None, "sem preço")
         if price < 1500:
-            return False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, "preço irreal (<1500)"
+            return ret("gpu:rtx5060:2fan", False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, "preço irreal (<1500)")
         if price < 1850:
-            return True, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, "<1850"
-        return False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, ">=1850"
+            return ret("gpu:rtx5060:2fan", True, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, "<1850")
+        return ret("gpu:rtx5060:2fan", False, "gpu:rtx5060:2fan", "RTX 5060 2 Fans", price, ">=1850")
     if RTX5060TI_RE.search(t):
         if price is None:
-            return False, "gpu:rtx5060ti", "RTX 5060 Ti", None, "sem preço"
+            return ret("gpu:rtx5060ti", False, "gpu:rtx5060ti", "RTX 5060 Ti", None, "sem preço")
         if price < 1500:
-            return False, "gpu:rtx5060ti", "RTX 5060 Ti", price, "preço irreal (<1500)"
+            return ret("gpu:rtx5060ti", False, "gpu:rtx5060ti", "RTX 5060 Ti", price, "preço irreal (<1500)")
         if price < 2100:
-            return True, "gpu:rtx5060ti", "RTX 5060 Ti", price, "<2100"
-        return False, "gpu:rtx5060ti", "RTX 5060 Ti", price, ">=2100"
+            return ret("gpu:rtx5060ti", True, "gpu:rtx5060ti", "RTX 5060 Ti", price, "<2100")
+        return ret("gpu:rtx5060ti", False, "gpu:rtx5060ti", "RTX 5060 Ti", price, ">=2100")
     if RTX5060_RE.search(t):
         if price is None:
-            return False, "gpu:rtx5060", "RTX 5060", None, "sem preço"
+            return ret("gpu:rtx5060", False, "gpu:rtx5060", "RTX 5060", None, "sem preço")
         if price < 1500:
-            return False, "gpu:rtx5060", "RTX 5060", price, "preço irreal (<1500)"
+            return ret("gpu:rtx5060", False, "gpu:rtx5060", "RTX 5060", price, "preço irreal (<1500)")
         if price < 1900:
-            return True, "gpu:rtx5060", "RTX 5060", price, "<1900"
-        return False, "gpu:rtx5060", "RTX 5060", price, ">=1900"
+            return ret("gpu:rtx5060", True, "gpu:rtx5060", "RTX 5060", price, "<1900")
+        return ret("gpu:rtx5060", False, "gpu:rtx5060", "RTX 5060", price, ">=1900")
     if RTX5070_FAM.search(t):
         if price is None:
-            return False, "gpu:rtx5070", "RTX 5070/5070 Ti", None, "sem preço"
+            return ret("gpu:rtx5070", False, "gpu:rtx5070", "RTX 5070/5070 Ti", None, "sem preço")
         if price < 2500:
-            return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "preço irreal (<2500)"
+            return ret("gpu:rtx5070", False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "preço irreal (<2500)")
         if price < 3500:
-            return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "<3500"
-        return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">=3500"
+            return ret("gpu:rtx5070", True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "<3500")
+        return ret("gpu:rtx5070", False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">=3500")
 
     # SSD Kingston M.2 1TB (<=400)
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
         if price is None:
-            return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", None, "sem preço"
+            return ret("ssd:kingston:m2:1tb", False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", None, "sem preço")
         if price <= 400:
-            return True, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "<=400"
-        return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, ">400"
+            return ret("ssd:kingston:m2:1tb", True, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "<=400")
+        return ret("ssd:kingston:m2:1tb", False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, ">400")
 
     # RAM 16GB DDR4 3200 (any brand)
     if RAM_16GB_3200_RE.search(t):
         if price is None:
-            return False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", None, "sem preço"
+            return ret("ram:16gb3200", False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", None, "sem preço")
         if price < 100:
-            return False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, "preço irreal (<100)"
+            return ret("ram:16gb3200", False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, "preço irreal (<100)")
         if price <= 300:
-            return True, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, "<=300"
-        return False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, ">300"
+            return ret("ram:16gb3200", True, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, "<=300")
+        return ret("ram:16gb3200", False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, ">300")
 
-    # Ar-condicionado inverter
+    # Ar inverter
     if AR_INVERTER_RE.search(t):
         if price is None:
-            return False, "ar_inverter", "Ar Condicionado Inverter", None, "sem preço"
+            return ret("ar_inverter", False, "ar_inverter", "Ar Condicionado Inverter", None, "sem preço")
         if price < 1000:
-            return False, "ar_inverter", "Ar Condicionado Inverter", price, "preço irreal (<1000)"
+            return ret("ar_inverter", False, "ar_inverter", "Ar Condicionado Inverter", price, "preço irreal (<1000)")
         if price < 1500:
-            return True, "ar_inverter", "Ar Condicionado Inverter", price, "<1500"
-        return False, "ar_inverter", "Ar Condicionado Inverter", price, ">=1500"
+            return ret("ar_inverter", True, "ar_inverter", "Ar Condicionado Inverter", price, "<1500")
+        return ret("ar_inverter", False, "ar_inverter", "Ar Condicionado Inverter", price, ">=1500")
 
-    # Monitores 27"+ 144Hz (mantido)
+    # Monitores 27"+ 144Hz
     if MONITOR_LG_27_RE.search(t):
         if price is None:
-            return False, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", None, "sem preço"
+            return ret("monitor:lg27", False, "monitor:lg27", 'Monitor LG UltraGear 27" 180Hz', None, "sem preço")
         if price < 200:
-            return False, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", price, "preço irreal (<200)"
+            return ret("monitor:lg27", False, "monitor:lg27", 'Monitor LG UltraGear 27" 180Hz', price, "preço irreal (<200)")
         if price < 700:
-            return True, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", price, "<700"
-        return False, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", price, ">=700"
+            return ret("monitor:lg27", True, "monitor:lg27", 'Monitor LG UltraGear 27" 180Hz', price, "<700")
+        return ret("monitor:lg27", False, "monitor:lg27", 'Monitor LG UltraGear 27" 180Hz', price, ">=700")
     if MONITOR_RE.search(t) and MONITOR_SIZE_RE.search(t) and MONITOR_144HZ_RE.search(t):
         if price is None:
-            return False, "monitor", "Monitor 27\"+ 144Hz+", None, "sem preço"
+            return ret("monitor", False, "monitor", 'Monitor 27"+ 144Hz+', None, "sem preço")
         if price < 200:
-            return False, "monitor", "Monitor 27\"+ 144Hz+", price, "preço irreal (<200)"
+            return ret("monitor", False, "monitor", 'Monitor 27"+ 144Hz+', price, "preço irreal (<200)")
         if price < 700:
-            return True, "monitor", "Monitor 27\"+ 144Hz+", price, "<700"
-        return False, "monitor", "Monitor 27\"+ 144Hz+", price, ">=700"
+            return ret("monitor", True, "monitor", 'Monitor 27"+ 144Hz+', price, "<700")
+        return ret("monitor", False, "monitor", 'Monitor 27"+ 144Hz+', price, ">=700")
 
-    return False, "none", "sem match", price, "sem match"
+    return ret("none", False, "none", "sem match", price, "sem match")
 
 # ---------------------------------------------
 # DUP GUARD (persistente)
@@ -530,7 +585,8 @@ def main():
                     if not msg_text:
                         return
 
-                    chat_id = getattr(event.chat, "id", getattr(event.message, "peer_id", None))
+                    chat = getattr(event, "chat", None)
+                    chat_id = getattr(chat, "id", getattr(event.message, "peer_id", None))
                     msg_id = getattr(event.message, "id", getattr(event, "id", None))
 
                     if chat_id is None or msg_id is None:
@@ -542,9 +598,8 @@ def main():
                         return
 
                     ok, key, title, price, reason = classify_and_match(msg_text)
-                    chan = getattr(event.chat, "username", "(desconhecido)")
+                    chan = getattr(chat, "username", "(desconhecido)")
                     chan_disp = f"@{chan}" if chan and chan != "(desconhecido)" else "(desconhecido)"
-
                     price_disp = f"{price:.2f}" if isinstance(price, (int, float)) else "None"
 
                     if ok:
