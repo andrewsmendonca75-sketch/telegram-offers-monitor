@@ -1,35 +1,175 @@
-# test_classify_ready.py
+# monitor_updated_full.py
 # -*- coding: utf-8 -*-
 """
-Autocontained test harness for classifier.
-Run: python3 test_classify_ready.py
+Realtime Telegram monitor (Telethon) - versão ajustada (integra alterações pedidas)
+
+Principais mudanças:
+- mobos até 600 reais (com sanity checks)
+- ssd kingston m.2 1tb até 400
+- memórias: qualquer 16GB DDR4 3200
+- removida mala de bordo
+- TV <= 1000; TV Box até 200
+- parser de preços mais robusto (context windows, ignora cupom/off quando perto do número)
+- uniformiza retorno do classify_and_match para (ok, key, title, price, reason)
 """
 
+import os
 import re
-from typing import Optional, List, Tuple
+import time
+import json
+import atexit
+import signal
+import logging
+import threading
+from typing import List, Optional, Tuple, Dict
+from datetime import datetime
+import requests
+from telethon import events
+from telethon.sessions import StringSession
+from telethon.sync import TelegramClient
 
-# -------------------------
-# Price parser (robust)
-# -------------------------
+# ---------------------------------------------
+# CONFIG / ENV
+# ---------------------------------------------
+START_TS = datetime.utcnow().isoformat() + "Z"
+PID = os.getpid()
+
+RETRY_SEND_ATTEMPTS = 3
+RETRY_SEND_BACKOFF = 1.0  # seconds, will multiply
+
+PERSIST_SEEN_FILE = os.getenv("PERSIST_SEEN_FILE", "/tmp/monitor_seen.json")
+PERSIST_MATCH_LOG = os.getenv("PERSIST_MATCH_LOG", "/tmp/monitor_matches.log")
+HEALTH_FILE = os.getenv("HEALTH_FILE", "/tmp/monitor_health")
+
+# Required envs
+missing = []
+try:
+    API_ID = int(os.environ.get("TELEGRAM_API_ID", ""))
+except Exception:
+    API_ID = None
+if not API_ID: missing.append("TELEGRAM_API_ID")
+
+API_HASH = os.environ.get("TELEGRAM_API_HASH") or ""
+if not API_HASH: missing.append("TELEGRAM_API_HASH")
+
+STRING_SESSION = os.environ.get("TELEGRAM_STRING_SESSION") or ""
+if not STRING_SESSION: missing.append("TELEGRAM_STRING_SESSION")
+
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN") or ""
+if not BOT_TOKEN: missing.append("TELEGRAM_TOKEN")
+
+MONITORED_CHANNELS_RAW = os.getenv("MONITORED_CHANNELS", "")
+USER_DESTINATIONS_RAW = os.getenv("USER_DESTINATIONS", os.getenv("USER_CHAT_ID", ""))
+
+if missing:
+    raise RuntimeError("Missing required envs: " + ", ".join(missing))
+
+# ---------------------------------------------
+# LOGGING
+# ---------------------------------------------
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s | %(levelname)5s | %(message)s",
+)
+log = logging.getLogger("monitor")
+
+log.info("▶️ Starting realtime monitor pid=%s ts=%s", PID, START_TS)
+
+# ---------------------------------------------
+# UTIL: CSV / Normalização
+# ---------------------------------------------
+def _split_csv(val: str) -> List[str]:
+    if not val: return []
+    return [p.strip() for p in val.split(",") if p and p.strip()]
+
+def _norm_username(u: str) -> Optional[str]:
+    if not u: return None
+    u = u.strip()
+    if not u: return None
+    if re.fullmatch(r"-?\d+", u):
+        return None
+    u = u.lower()
+    if not u.startswith("@"):
+        u = "@" + u
+    return u
+
+MONITORED_USERNAMES: List[str] = []
+for x in _split_csv(MONITORED_CHANNELS_RAW):
+    nu = _norm_username(x)
+    if nu:
+        MONITORED_USERNAMES.append(nu)
+
+if not MONITORED_USERNAMES:
+    log.warning("MONITORED_CHANNELS vazio — nada será filtrado por username.")
+else:
+    log.info("▶️ Canais: %s", ", ".join(MONITORED_USERNAMES))
+
+USER_DESTINATIONS: List[str] = _split_csv(USER_DESTINATIONS_RAW)
+if not USER_DESTINATIONS:
+    log.warning("USER_DESTINATIONS/USER_CHAT_ID não definido; nada será enviado.")
+else:
+    log.info("📬 Destinos: %s", ", ".join(USER_DESTINATIONS))
+
+BOT_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# ---------------------------------------------
+# BOT SEND WITH RETRIES (requests)
+# ---------------------------------------------
+_send_lock = threading.Lock()
+
+def bot_send_text(dest: str, text: str) -> Tuple[bool, str]:
+    """Synchronous send via Bot API with retries and backoff."""
+    payload = {"chat_id": dest, "text": text, "disable_web_page_preview": True}
+    attempt = 0
+    backoff = RETRY_SEND_BACKOFF
+    last_err = None
+    while attempt < RETRY_SEND_ATTEMPTS:
+        try:
+            with _send_lock:
+                r = requests.post(f"{BOT_BASE}/sendMessage", json=payload, timeout=20)
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("ok"):
+                    return True, "ok"
+                last_err = f"api-error: {r.text}"
+            else:
+                last_err = f"status={r.status_code} text={r.text}"
+        except Exception as e:
+            last_err = repr(e)
+        attempt += 1
+        log.debug("bot_send_text retry %d/%d -> %s", attempt, RETRY_SEND_ATTEMPTS, last_err)
+        time.sleep(backoff)
+        backoff *= 2
+    return False, last_err or "unknown-error"
+
+def notify_all(text: str):
+    for d in USER_DESTINATIONS:
+        ok, msg = bot_send_text(d, text)
+        if ok:
+            log.info("· envio=ok → %s", d)
+        else:
+            log.error("· envio=ERRO → %s | motivo=%s", d, msg)
+
+# ---------------------------------------------
+# PRICE PARSER (BRL) - robust context-aware
+# ---------------------------------------------
 PRICE_PIX_RE = re.compile(
     r"(?i)r\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{1,2})?)\s*(?:no\s*pix|à\s*vista|a\s*vista|à\s*vista:|avista)",
     re.I
 )
 PRICE_FALLBACK_RE = re.compile(r"(?i)r\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{1,2})?)", re.I)
-
-# words that indicate the number is NOT a product price (coupons / discounts / parcel)
-NOT_PRICE_WORDS = re.compile(
-    r"(?i)\b(cupom|cupom:|off|desconto|promo|promoção|promoção:|parcelas?|parcelado|parcelamento|x\s*de|frete|cashback|pontos?|reembolso|resgate|oferta.*cupom)\b",
-    re.I
-)
-
 URL_RE = re.compile(r"https?://\S+", re.I)
+
+# two-level negative indicators:
+SMALL_NEG_RE = re.compile(
+    r"(?i)\b(off|off:|desconto|desconto:|cupom|cupom:|resgate|x\s*de|parcelas?|parcelado|parcelamento)\b"
+)
+BIG_NEG_RE = re.compile(r"(?i)\b(cashback|pontos?|reembolso|voucher)\b", re.I)
 
 def _to_float_brl(raw: str) -> Optional[float]:
     s = raw.strip().replace(".", "").replace(",", ".")
     try:
         v = float(s)
-        # sensible limits
         if v <= 0 or v < 0.5 or v > 5_000_000:
             return None
         return v
@@ -37,43 +177,49 @@ def _to_float_brl(raw: str) -> Optional[float]:
         return None
 
 def find_lowest_price(text: str) -> Optional[float]:
+    """Find plausible lowest price in text, ignoring coupon/off values when they are adjacent."""
     if not text:
         return None
-    txt = URL_RE.sub(" ", text)  # remove urls (they often contain irrelevant prices)
+    txt = URL_RE.sub(" ", text)
     vals: List[float] = []
-    # prefer explicit à vista / pix
+
+    def valid_context(m):
+        start = m.start(); end = m.end()
+        s_start = max(0, start - 12); s_end = min(len(txt), end + 12)
+        if SMALL_NEG_RE.search(txt[s_start:s_end]):
+            return False
+        b_start = max(0, start - 80); b_end = min(len(txt), end + 80)
+        if BIG_NEG_RE.search(txt[b_start:b_end]):
+            return False
+        return True
+
+    # explicit à vista / pix
     for m in PRICE_PIX_RE.finditer(txt):
-        start = max(0, m.start() - 80); end = min(len(txt), m.end() + 80)
-        ctx = txt[start:end]
-        if NOT_PRICE_WORDS.search(ctx):
+        if not valid_context(m):
             continue
         v = _to_float_brl(m.group(1))
-        if v:
+        if v is not None and v >= 10:
             vals.append(v)
+
+    # fallback any R$
     if not vals:
         for m in PRICE_FALLBACK_RE.finditer(txt):
-            start = max(0, m.start() - 80); end = min(len(txt), m.end() + 80)
-            ctx = txt[start:end]
-            if NOT_PRICE_WORDS.search(ctx):
+            if not valid_context(m):
                 continue
             v = _to_float_brl(m.group(1))
-            if v:
+            if v is not None and v >= 10:
                 vals.append(v)
+
     return min(vals) if vals else None
 
-# -------------------------
-# Regex rules (refined)
-# -------------------------
-BLOCK_CATS = re.compile(
-    r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook|geladeira|refrigerador|m[aá]quina\s*de\s*lavar|lavadora|lava\s*e\s*seca)\b",
-    re.I
-)
+# ---------------------------------------------
+# REGEX RULES (updated)
+# ---------------------------------------------
+BLOCK_CATS = re.compile(r"\b(celular|smartphone|iphone|android|notebook|laptop|macbook|geladeira|refrigerador|m[aá]quina\s*de\s*lavar|lavadora|lava\s*e\s*seca)\b", re.I)
 PC_GAMER_RE = re.compile(r"\b(pc\s*gamer|setup\s*completo|kit\s*completo)\b", re.I)
 
-# TV Box: specifically boxes (mi box, xiaomi box, tv box, android tv box) - NOT 'Google TV' alone
-TVBOX_RE = re.compile(r"\b(?:tv\s*box|xiaomi\s*box|mi\s*box|mi-box|mi\s+box|android\s*tv\s*box)\b", re.I)
-
-# TV: generic mentions of TV / Smart TV / Televisão
+# TV Box: specific boxes only (mi/xiaomi/mi box / android tv box)
+TVBOX_RE = re.compile(r"\b(?:tv\s*box|xiaomi\s*box|mi\s*box|mi-box|android\s*tv\s*box)\b", re.I)
 TV_RE = re.compile(r"\b(?:tv|smart\s*tv|televis(?:ão|ao))\b", re.I)
 
 # Monitors
@@ -84,9 +230,9 @@ MONITOR_144HZ_RE = re.compile(r"\b(14[4-9]|1[5-9]\d|[2-9]\d{2})\s*hz\b", re.I)
 MONITOR_LG_27_RE = re.compile(r"\b27gs60f\b|(?=.*\blg\b)(?=.*\bultragear\b)(?=.*\b27\s*(?:\"|')?)(?=.*\b180\s*hz\b)(?=.*\b(?:fhd|full\s*hd)\b)", re.I)
 
 # Mobos
-A520_RE = re.compile(r"\ba520m?\b", re.I)
-H610_RE = re.compile(r"\bh610m?\b", re.I)
-LGA1700_RE = re.compile(r"\b(?:b660m?|b760m?|z690|z790)\b", re.I)
+A520_RE     = re.compile(r"\ba520m?\b", re.I)
+H610_RE     = re.compile(r"\bh610m?\b", re.I)
+LGA1700_RE  = re.compile(r"\b(?:b660m?|b760m?|z690|z790)\b", re.I)
 SPECIFIC_B760M_RE = re.compile(r"\bb760m\b", re.I)
 
 # SSD
@@ -94,14 +240,23 @@ SSD_RE  = re.compile(r"\bssd\b.*\bkingston\b|\bkingston\b.*\bssd\b", re.I)
 M2_RE   = re.compile(r"\bm\.?2\b|\bnvme\b", re.I)
 TB1_RE  = re.compile(r"\b1\s*tb\b", re.I)
 
-# RAM
+# RAM 16GB DDR4 3200 (any brand)
 RAM_16GB_3200_RE = re.compile(r"\b(?:ddr4)\b.*\b16\s*gb\b.*\b3200\b|\b16\s*gb\b.*\b(?:ddr4)\b.*\b3200\b", re.I)
 
-# GPUs / CPUs (kept similar)
-RTX5060_3FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(3|triple)\b.*\b(fan|fans)\b|\btriple\s*fan\b.*\brtx\s*5060\b", re.I)
-RTX5060_2FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(2|dual)\b.*\b(fan|fans)\b|\bdual\s*fan\b.*\brtx\s*5060\b", re.I)
+# Other categories (abrangendo pedidos anteriores)
+WATER_240MM_ARGB_RE = re.compile(r"\bwater\s*cooler\b.*\b240\s*mm\b.*\bargb\b", re.I)
+DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s*5)\b", re.I)
+AR_INVERTER_RE = re.compile(r"\bar\s*condicionado\b.*\binverter\b|\binverter\b.*\bar\s*condicionado\b", re.I)
+KINDLE_RE = re.compile(r"\bkindle\b", re.I)
+CAFETEIRA_PROG_RE = re.compile(r"\bcafeteira\b.*\bprogr[aá]m[aá]vel\b", re.I)
+TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
+WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b", re.I)
+
+# GPUs / CPUs (kept original structure)
+RTX5060_3FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(3\s*(?:fans?|oc|x)|triple\s*fan)\b|\b(3\s*(?:fans?|oc|x)|triple\s*fan)\b.*\brtx\s*5060(?!\s*ti)\b", re.I)
+RTX5060_2FAN_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b.*\b(2\s*(?:fans?|oc|x)|dual\s*fan)\b|\b(2\s*(?:fans?|oc|x)|dual\s*fan)\b.*\brtx\s*5060(?!\s*ti)\b", re.I)
+RTX5060_RE   = re.compile(r"\brtx\s*5060(?!\s*ti)\b", re.I)
 RTX5060TI_RE = re.compile(r"\brtx\s*5060\s*ti\b", re.I)
-RTX5060_RE = re.compile(r"\brtx\s*5060(?!\s*ti)\b", re.I)
 RTX5070_FAM  = re.compile(r"\brtx\s*5070(\s*ti)?\b", re.I)
 
 RYZEN_7_5700X_RE = re.compile(r"\bryzen\s*7\s*5700x\b", re.I)
@@ -110,22 +265,32 @@ INTEL_SUP = re.compile(r"\b(i5[-\s]*14[4-9]\d{2}[kf]*|i5[-\s]*145\d{2}[kf]*|i7[-
 AMD_SUP   = re.compile(r"\b(ryzen\s*7\s*5700x[3d]*|ryzen\s*7\s*5800x[3d]*|ryzen\s*9\s*5900x|ryzen\s*9\s*5950x)\b", re.I)
 AMD_BLOCK = re.compile(r"\b(ryzen\s*(?:3|5)\s|5600g?t?|5500|5700(?!x))\b", re.I)
 
-# Other
-WATER_240MM_ARGB_RE = re.compile(r"\bwater\s*cooler\b.*\b240\s*mm\b.*\bargb\b", re.I)
-CADEIRA_RE = re.compile(r"\bcadeira\b", re.I)
-DUALSENSE_RE = re.compile(r"\b(dualsense|controle\s*ps5|controle\s*playstation\s*5)\b", re.I)
-AR_INVERTER_RE = re.compile(r"\bar\s*condicionado\b.*\binverter\b|\binverter\b.*\bar\s*condicionado\b", re.I)
-KINDLE_RE = re.compile(r"\bkindle\b", re.I)
-CAFETEIRA_PROG_RE = re.compile(r"\bcafeteira\b.*\bprogr[aá]m[aá]vel\b", re.I)
-TENIS_NIKE_RE = re.compile(r"\b(tênis|tenis)\s*(nike|air\s*max|air\s*force|jordan)\b", re.I)
-WEBCAM_4K_RE = re.compile(r"\bwebcam\b.*\b4k\b", re.I)
+# ---------------------------------------------
+# HELPERS (headers / thresholds)
+# ---------------------------------------------
+def needs_header(product_key: str, price: Optional[float]) -> bool:
+    if not price: return False
+    if product_key == "gpu:rtx5060:3fan" and price < 1950: return True
+    if product_key == "gpu:rtx5060:2fan" and price < 1850: return True
+    if product_key == "gpu:rtx5060ti" and price < 2100: return True
+    if product_key == "cpu:ryzen7_5700x" and price < 800: return True
+    if product_key == "cpu:i5_14400f" and price < 750: return True
+    if product_key.startswith("cpu:") and price < 900: return True
+    if product_key == "dualsense" and price < 300: return True
+    if product_key == "monitor:lg27" and price < 700: return True
+    return False
 
-# -------------------------
-# Classifier - uniform return
-# -------------------------
+def get_header_text(product_key: str) -> str:
+    if product_key == "ar_premium":
+        return "Oportunidade🔥 "
+    return "Corre!🔥 "
+
+# ---------------------------------------------
+# CORE MATCHER (uniform return)
+# ---------------------------------------------
 def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]:
     """
-    Returns: (ok: bool, key: str, title: str, price: Optional[float], reason: str)
+    Returns (ok: bool, key: str, title: str, price: Optional[float], reason: str)
     """
     t = text or ""
     if BLOCK_CATS.search(t):
@@ -157,11 +322,11 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]
     if MONITOR_SMALL_RE.search(t):
         return False, "monitor:block_small", "Monitor < 27\"", price, "tamanho pequeno"
 
-    # Mobos (A520/H610 blocked)
+    # Placas-mãe (B660/B760/Z690/Z790) — match se <600 e >=300
     if A520_RE.search(t):
-        return False, "mobo:a520", "A520 bloqueada", price, "A520 bloqueada"
+        return False, "mobo:a520", "A520", price, "A520 bloqueada"
     if H610_RE.search(t):
-        return False, "mobo:h610", "H610 bloqueada", price, "H610 bloqueada"
+        return False, "mobo:h610", "H610", price, "H610 bloqueada"
     if LGA1700_RE.search(t) or SPECIFIC_B760M_RE.search(t):
         if price is None:
             return False, "mobo:lga1700", "Placa-mãe LGA1700/B760", None, "sem preço"
@@ -171,7 +336,7 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]
             return True, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, "<600"
         return False, "mobo:lga1700", "Placa-mãe LGA1700/B760", price, ">=600"
 
-    # GPUs
+    # GPUs (kept)
     if RTX5060_3FAN_RE.search(t):
         if price is None:
             return False, "gpu:rtx5060:3fan", "RTX 5060 3 Fans", None, "sem preço"
@@ -213,7 +378,7 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]
             return True, "gpu:rtx5070", "RTX 5070/5070 Ti", price, "<3500"
         return False, "gpu:rtx5070", "RTX 5070/5070 Ti", price, ">=3500"
 
-    # SSD Kingston
+    # SSD Kingston M.2 1TB (<=400)
     if SSD_RE.search(t) and M2_RE.search(t) and TB1_RE.search(t):
         if price is None:
             return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", None, "sem preço"
@@ -221,7 +386,7 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]
             return True, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, "<=400"
         return False, "ssd:kingston:m2:1tb", "SSD Kingston M.2 1TB", price, ">400"
 
-    # RAM DDR4 16GB 3200
+    # RAM 16GB DDR4 3200 (any brand)
     if RAM_16GB_3200_RE.search(t):
         if price is None:
             return False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", None, "sem preço"
@@ -231,7 +396,7 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]
             return True, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, "<=300"
         return False, "ram:16gb3200", "Memória 16GB DDR4 3200MHz", price, ">300"
 
-    # Ar inverter
+    # Ar-condicionado inverter
     if AR_INVERTER_RE.search(t):
         if price is None:
             return False, "ar_inverter", "Ar Condicionado Inverter", None, "sem preço"
@@ -241,7 +406,7 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]
             return True, "ar_inverter", "Ar Condicionado Inverter", price, "<1500"
         return False, "ar_inverter", "Ar Condicionado Inverter", price, ">=1500"
 
-    # Monitors 27"+ 144Hz
+    # Monitores 27"+ 144Hz (mantido)
     if MONITOR_LG_27_RE.search(t):
         if price is None:
             return False, "monitor:lg27", "Monitor LG UltraGear 27\" 180Hz", None, "sem preço"
@@ -261,85 +426,181 @@ def classify_and_match(text: str) -> Tuple[bool, str, str, Optional[float], str]
 
     return False, "none", "sem match", price, "sem match"
 
+# ---------------------------------------------
+# DUP GUARD (persistente)
+# ---------------------------------------------
+class Seen:
+    def __init__(self, maxlen=2500):
+        self.maxlen = maxlen
+        self.data: Dict[str, float] = {}
+        self.lock = threading.Lock()
+        self._load()
 
-# -------------------------
-# Tests
-# -------------------------
-TESTS = [
-    {
-        "label": "Xiaomi Box S 350 (TV Box >200 -> IGNORE)",
-        "text": """Xiaomi Box S 3ª Geração 4K por R$ 350‼️
+    def _key(self, chat_id, msg_id) -> str:
+        return f"{chat_id}:{msg_id}"
 
-Xiaomi Box S 3ª Geração 4K 2GB RAM 32GB WiFi6 Google TV
+    def is_dup(self, chat_id, msg_id):
+        key = self._key(chat_id, msg_id)
+        with self.lock:
+            if key in self.data:
+                return True
+            if len(self.data) > self.maxlen:
+                items = sorted(self.data.items(), key=lambda kv: kv[1], reverse=True)[: self.maxlen // 2]
+                self.data = {k: v for k, v in items}
+            self.data[key] = time.time()
+        return False
 
-🔥 R$ 350,00  
+    def dump(self):
+        try:
+            with self.lock:
+                with open(PERSIST_SEEN_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"ts": time.time(), "items": list(self.data.keys())}, f)
+            log.info("Persisted seen -> %s (%d items)", PERSIST_SEEN_FILE, len(self.data))
+        except Exception as e:
+            log.exception("Erro ao persistir seen: %s", e)
 
-Cupom: VIRADADECUPOM
+    def _load(self):
+        try:
+            if os.path.exists(PERSIST_SEEN_FILE):
+                with open(PERSIST_SEEN_FILE, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                items = d.get("items") or []
+                now = time.time()
+                with self.lock:
+                    for k in items[-self.maxlen:]:
+                        self.data[k] = now
+                log.info("Loaded seen from %s (%d items)", PERSIST_SEEN_FILE, len(self.data))
+        except Exception as e:
+            log.warning("Falha ao carregar seen persistido: %s", e)
 
-Link: https://mercadolivre.com/sec/1QYwUV4
+seen = Seen()
 
-Frete grátis
+# ---------------------------------------------
+# Match history logging (append-only)
+# ---------------------------------------------
+_matches_lock = threading.Lock()
+def append_match_log(record: dict):
+    try:
+        with _matches_lock:
+            with open(PERSIST_MATCH_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        log.exception("Erro ao gravar match log")
 
-— via @outletblackfriday""",
-        "expected_ok": False,
-        "expected_key": "tvbox",
-        "expected_price": 350.0
-    },
-    {
-        "label": "Ar Condicionado TCL 1438 (AR inverter match)",
-        "text": """🔥 AR CONDICIONADO TCL SPLIT HI WALL ELITE INVERTER 12.000 BTUS TAC-12CSGV-INV 220V
+# ---------------------------------------------
+# MAIN
+# ---------------------------------------------
+def main():
+    log.info("Conectando ao Telegram (StringSession)...")
+    with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
+        try:
+            log.info("Conectado ao Telegram.")
+            dialogs = client.get_dialogs()
+            uname2ent = {}
+            for d in dialogs:
+                ent = getattr(d, "entity", None)
+                uname = getattr(ent, "username", None)
+                if uname:
+                    uname2ent[f"@{uname.lower()}"] = ent
+            resolved = [uname2ent[u] for u in MONITORED_USERNAMES if u in uname2ent]
+            log.info("✅ Monitorando %d canais…", len(resolved))
 
-💸 - R$1.438,10 à vista 
-🎟 - Cupom: VEMQUEVEM 
-🚚 - FRETE GRÁTIS!""",
-        "expected_ok": True,
-        "expected_key": "ar_inverter",
-        "expected_price": 1438.10
-    },
-    {
-        "label": "Smart TV Toshiba 1690 (TV >1000 -> IGNORE)",
-        "text": """➡️ Smart TV QLED 55 4K Toshiba Google TV 3HDMI 2USB Wi-Fi
+            def touch_health():
+                try:
+                    with open(HEALTH_FILE, "w", encoding="utf-8") as hf:
+                        hf.write(json.dumps({"pid": PID, "ts": time.time(), "start": START_TS}))
+                except Exception:
+                    log.exception("Erro ao escrever HEALTH file")
 
-✅ R$ 1.690 😱😱 12x Sem Juros
-🏷 Resgate cupom R$ 200 OFF aqui:
-https://s.shopee.com.br/50Rg4YyBHr""",
-        "expected_ok": False,
-        "expected_key": "tv",
-        "expected_price": 1690.0
-    },
-    {"label": "SSD Kingston 399.90 -> match", "text": "SSD Kingston NVMe M.2 1 TB por R$ 399,90. Frete grátis.", "expected_ok": True, "expected_key":"ssd:kingston:m2:1tb", "expected_price":399.90},
-    {"label": "RAM 16GB DDR4 3200 289.90 -> match", "text":"Memória DDR4 16 GB 3200 MHz — várias marcas, R$ 289,90", "expected_ok":True, "expected_key":"ram:16gb3200","expected_price":289.90},
-    {"label": "Monitor 24\" 199 -> small block", "text": "Monitor 24\" 199,00 promoção", "expected_ok":False, "expected_key":"monitor:block_small","expected_price":199.0},
-    {"label": "Mobo B760M 599 -> match (<=600)", "text": "B760M ATX, placa-mãe B760 por R$ 599,00 - pronta entrega", "expected_ok":True, "expected_key":"mobo:lga1700","expected_price":599.0},
-    {"label": "TV Box 150 -> match", "text": "Mi Box TV BOX R$ 150,00 promocao", "expected_ok":True, "expected_key":"tvbox","expected_price":150.0},
-]
+            touch_health()
+            def health_loop():
+                while True:
+                    touch_health()
+                    time.sleep(30)
+            t = threading.Thread(target=health_loop, daemon=True)
+            t.start()
 
-def approx(a, b, tol=0.5):
-    if a is None and b is None: return True
-    if isinstance(a, (int,float)) and isinstance(b, (int,float)):
-        return abs(a - b) <= tol
-    return False
+            @client.on(events.NewMessage(chats=resolved or None))
+            async def handler(event):
+                try:
+                    msg_text = (event.raw_text or "").strip()
+                    if not msg_text:
+                        msg_text = getattr(event.message, "message", "") or ""
+                        msg_text = (msg_text or "").strip()
+                    if not msg_text:
+                        return
 
-def run_tests():
-    passed = 0
-    for tc in TESTS:
-        ok, key, title, price, reason = classify_and_match(tc["text"])
-        expect_ok = tc["expected_ok"]
-        expect_key = tc["expected_key"]
-        expect_price = tc["expected_price"]
-        key_ok = (key == expect_key)
-        price_ok = approx(price, expect_price)
-        ok_ok = (ok == expect_ok)
-        all_ok = key_ok and price_ok and ok_ok
-        print("-"*80)
-        print("TEST:", tc["label"])
-        print("EXPECTED: ok=", expect_ok, " key=", expect_key, " price=", expect_price)
-        print("GOT     : ok=", ok, " key=", key, " price=", price, " reason=", reason)
-        print("RESULT  :", "PASS" if all_ok else "FAIL")
-        if all_ok:
-            passed += 1
-    print("="*80)
-    print(f"Passed {passed}/{len(TESTS)} tests")
+                    chat_id = getattr(event.chat, "id", getattr(event.message, "peer_id", None))
+                    msg_id = getattr(event.message, "id", getattr(event, "id", None))
 
+                    if chat_id is None or msg_id is None:
+                        chat_id = "unknown"
+                        msg_id = hash(msg_text)
+
+                    if seen.is_dup(chat_id, msg_id):
+                        log.debug("Duplicated message ignored chat=%s id=%s", chat_id, msg_id)
+                        return
+
+                    ok, key, title, price, reason = classify_and_match(msg_text)
+                    chan = getattr(event.chat, "username", "(desconhecido)")
+                    chan_disp = f"@{chan}" if chan and chan != "(desconhecido)" else "(desconhecido)"
+
+                    price_disp = f"{price:.2f}" if isinstance(price, (int, float)) else "None"
+
+                    if ok:
+                        header = get_header_text(key) if needs_header(key, price) else ""
+                        msg = f"{header}{msg_text}\n\n— via {chan_disp}"
+                        log.info("[%-18s] MATCH → %s | price=%s | key=%s | reason=%s | header=%s",
+                                 chan_disp, title, price_disp, key, reason, "YES" if header else "NO")
+                        try:
+                            notify_all(msg)
+                        except Exception:
+                            log.exception("Erro ao notificar destinos")
+                        append_match_log({
+                            "ts": time.time(),
+                            "chan": chan_disp,
+                            "title": title,
+                            "key": key,
+                            "price": price,
+                            "reason": reason,
+                            "text": msg_text[:4000]
+                        })
+                    else:
+                        log.info("[%-18s] IGNORADO → %s | price=%s | key=%s | reason=%s",
+                                 chan_disp, title, price_disp, key, reason)
+
+                except Exception as e:
+                    log.exception("Handler exception: %s", e)
+
+            client.run_until_disconnected()
+
+        except Exception as e:
+            log.exception("Erro fatal no main: %s", e)
+        finally:
+            log.info("Finalizando client, persistindo estado...")
+            seen.dump()
+
+# ---------------------------------------------
+# Graceful shutdown hooks
+# ---------------------------------------------
+def _on_exit(signum=None, frame=None):
+    log.info("Sinal de parada recebido (%s). Persistindo estado e saindo...", signum)
+    try:
+        seen.dump()
+    except Exception:
+        log.exception("Erro no dump on exit")
+    try:
+        with open(HEALTH_FILE, "w", encoding="utf-8") as hf:
+            hf.write(json.dumps({"pid": PID, "ts": time.time(), "shutdown": True}))
+    except Exception:
+        pass
+
+atexit.register(_on_exit)
+signal.signal(signal.SIGTERM, _on_exit)
+signal.signal(signal.SIGINT, _on_exit)
+
+# ---------------------------------------------
+# Entrypoint
+# ---------------------------------------------
 if __name__ == "__main__":
-    run_tests()
+    main()
